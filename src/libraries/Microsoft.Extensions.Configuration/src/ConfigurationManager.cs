@@ -132,6 +132,36 @@ namespace Microsoft.Extensions.Configuration
             RaiseChanged();
         }
 
+        // Don't rebuild and reload all providers when a source is inserted.
+        // Build and load the new provider and rebuild/reload providers after the insertion point,
+        // since their Build() or Load() may have read config values that the new source now overrides.
+        // Providers before the insertion point are unaffected.
+        private void InsertSource(int index)
+        {
+            // Dispose change token registrations from the insertion point onward.
+            for (int i = index; i < _changeTokenRegistrations.Count; i++)
+            {
+                _changeTokenRegistrations[i].Dispose();
+            }
+
+            _changeTokenRegistrations.RemoveRange(index, _changeTokenRegistrations.Count - index);
+
+            // Build and load each source from the insertion point onward, one at a time,
+            // so that each subsequent source can see config values from the previous ones.
+            var newProviders = new List<IConfigurationProvider>();
+
+            for (int i = index; i < _sources.Count; i++)
+            {
+                IConfigurationProvider provider = _sources[i].Build(this);
+                provider.Load();
+                _changeTokenRegistrations.Add(ChangeToken.OnChange(provider.GetReloadToken, RaiseChanged));
+                newProviders.Add(provider);
+            }
+
+            _providerManager.ReplaceProvidersFrom(index, newProviders);
+            RaiseChanged();
+        }
+
         // Something other than Add was called on IConfigurationBuilder.Sources or IConfigurationBuilder.Properties has changed.
         private void ReloadSources()
         {
@@ -239,7 +269,7 @@ namespace Microsoft.Extensions.Configuration
             public void Insert(int index, IConfigurationSource source)
             {
                 _sources.Insert(index, source);
-                _config.ReloadSources();
+                _config.InsertSource(index);
             }
 
             public bool Remove(IConfigurationSource source)

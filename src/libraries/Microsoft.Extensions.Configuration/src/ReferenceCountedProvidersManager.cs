@@ -75,6 +75,50 @@ namespace Microsoft.Extensions.Configuration
             }
         }
 
+        public void ReplaceProvidersFrom(int index, List<IConfigurationProvider> newProviders)
+        {
+            List<IConfigurationProvider>? replacedProviders;
+
+            lock (_replaceProvidersLock)
+            {
+                if (_disposed)
+                {
+                    throw new ObjectDisposedException(nameof(ConfigurationManager));
+                }
+
+                // Keep providers before the index, replace the rest with newProviders.
+                List<IConfigurationProvider> oldProviders = _refCountedProviders.Providers;
+
+                // Collect replaced providers for disposal.
+                replacedProviders = oldProviders.Count > index
+                    ? oldProviders.GetRange(index, oldProviders.Count - index)
+                    : null;
+
+                var mergedProviders = new List<IConfigurationProvider>(index + newProviders.Count);
+                for (int i = 0; i < index; i++)
+                {
+                    mergedProviders.Add(oldProviders[i]);
+                }
+
+                mergedProviders.AddRange(newProviders);
+
+                // Maintain existing references, but replace the list with a copy-on-write swap.
+                _refCountedProviders.Providers = mergedProviders;
+            }
+
+            // Dispose replaced providers outside the lock. Concurrent readers who already obtained
+            // a reference to the old list may still be iterating it, but these providers are no longer
+            // part of the active provider set. This matches the existing disposal pattern where
+            // modifying sources is not thread-safe with respect to other modifications.
+            if (replacedProviders is not null)
+            {
+                foreach (IConfigurationProvider provider in replacedProviders)
+                {
+                    (provider as IDisposable)?.Dispose();
+                }
+            }
+        }
+
         public void Dispose()
         {
             ReferenceCountedProviders oldRefCountedProviders = _refCountedProviders;

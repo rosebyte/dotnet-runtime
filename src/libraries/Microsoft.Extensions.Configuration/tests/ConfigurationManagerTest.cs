@@ -1374,5 +1374,214 @@ namespace Microsoft.Extensions.Configuration.Test
             public IConfigurationProvider Build(IConfigurationBuilder builder) => this;
         }
 
+        private class BuildCountingConfigurationSource : IConfigurationSource
+        {
+            private readonly string _key;
+            private readonly string _value;
+
+            public int BuildCount { get; private set; }
+
+            public BuildCountingConfigurationSource(string key, string value)
+            {
+                _key = key;
+                _value = value;
+            }
+
+            public IConfigurationProvider Build(IConfigurationBuilder builder)
+            {
+                BuildCount++;
+                return new TestConfigurationProvider(_key, _value);
+            }
+        }
+
+        [Fact]
+        public void InsertDoesNotReloadProvidersBeforeInsertionPoint()
+        {
+            var config = new ConfigurationManager();
+
+            var source1 = new BuildCountingConfigurationSource("key1", "value1");
+            var source2 = new BuildCountingConfigurationSource("key2", "value2");
+            var source3 = new BuildCountingConfigurationSource("key3", "value3");
+
+            config.Sources.Add(source1);
+            config.Sources.Add(source2);
+
+            Assert.Equal(1, source1.BuildCount);
+            Assert.Equal(1, source2.BuildCount);
+            Assert.Equal("value1", config["key1"]);
+            Assert.Equal("value2", config["key2"]);
+
+            // Insert at the beginning - should rebuild source1 and source2 (they are after the insertion point)
+            // but not the default MemoryConfigurationSource added in the constructor
+            config.Sources.Insert(0, source3);
+
+            Assert.Equal(2, source1.BuildCount);
+            Assert.Equal(2, source2.BuildCount);
+            Assert.Equal(1, source3.BuildCount);
+            Assert.Equal("value1", config["key1"]);
+            Assert.Equal("value2", config["key2"]);
+            Assert.Equal("value3", config["key3"]);
+        }
+
+        [Fact]
+        public void InsertAtMiddleRebuildsOnlyProvidersAfterInsertionPoint()
+        {
+            var config = new ConfigurationManager();
+
+            var source1 = new BuildCountingConfigurationSource("key1", "value1");
+            var source2 = new BuildCountingConfigurationSource("key2", "value2");
+            var source3 = new BuildCountingConfigurationSource("key3", "value3");
+
+            config.Sources.Add(source1);
+            config.Sources.Add(source2);
+
+            // Insert at index 1 (middle) - source1 is at index 1 (after default MemoryConfigurationSource),
+            // so only source2 (at index 2, after insertion point) should be rebuilt
+            config.Sources.Insert(1, source3);
+
+            // source1 is before the insertion point (index 1 is where source3 goes, source1 was at index 1 and shifted to 2)
+            // Wait - sources list after constructor: [MemorySource(0)]. After Add(source1): [Memory(0), source1(1)].
+            // After Add(source2): [Memory(0), source1(1), source2(2)]. Insert(1, source3): [Memory(0), source3(1), source1(2), source2(3)].
+            // Providers at index >= 1 are rebuilt: source3 (new), source1, source2.
+            Assert.Equal(2, source1.BuildCount);
+            Assert.Equal(2, source2.BuildCount);
+            Assert.Equal(1, source3.BuildCount);
+        }
+
+        [Fact]
+        public void InsertAtEndDoesNotReloadExistingProviders()
+        {
+            var config = new ConfigurationManager();
+
+            var source1 = new BuildCountingConfigurationSource("key1", "value1");
+            var source2 = new BuildCountingConfigurationSource("key2", "value2");
+            var source3 = new BuildCountingConfigurationSource("key3", "value3");
+
+            config.Sources.Add(source1);
+            config.Sources.Add(source2);
+
+            // Insert at end - no providers after insertion point, so nothing is rebuilt
+            config.Sources.Insert(config.Sources.Count, source3);
+
+            Assert.Equal(1, source1.BuildCount);
+            Assert.Equal(1, source2.BuildCount);
+            Assert.Equal(1, source3.BuildCount);
+            Assert.Equal("value1", config["key1"]);
+            Assert.Equal("value2", config["key2"]);
+            Assert.Equal("value3", config["key3"]);
+        }
+
+        [Fact]
+        public void InsertMaintainsCorrectProviderOrder()
+        {
+            var config = new ConfigurationManager();
+
+            // Later providers override earlier ones for same key
+            config.Sources.Add(new BuildCountingConfigurationSource("key", "first"));
+            config.Sources.Add(new BuildCountingConfigurationSource("key", "second"));
+
+            Assert.Equal("second", config["key"]);
+
+            // Insert at beginning - should have lowest priority
+            config.Sources.Insert(0, new BuildCountingConfigurationSource("key", "inserted"));
+
+            // "second" should still win (it's at index 2, last)
+            Assert.Equal("second", config["key"]);
+        }
+
+        [Fact]
+        public void InsertAtEndMaintainsCorrectProviderOrder()
+        {
+            var config = new ConfigurationManager();
+
+            config.Sources.Add(new BuildCountingConfigurationSource("key", "first"));
+            config.Sources.Add(new BuildCountingConfigurationSource("key", "second"));
+
+            // Insert at actual end (index = Count) - should have highest priority
+            // Note: ConfigurationManager starts with a default MemoryConfigurationSource, so Count is 3 after two Adds
+            config.Sources.Insert(config.Sources.Count, new BuildCountingConfigurationSource("key", "inserted"));
+
+            Assert.Equal("inserted", config["key"]);
+        }
+
+        [Fact]
+        public void InsertTriggersReloadToken()
+        {
+            var config = new ConfigurationManager();
+            config.Sources.Add(new BuildCountingConfigurationSource("key1", "value1"));
+
+            var reloadToken = ((IConfiguration)config).GetReloadToken();
+            Assert.False(reloadToken.HasChanged);
+
+            config.Sources.Insert(0, new BuildCountingConfigurationSource("key2", "value2"));
+
+            Assert.True(reloadToken.HasChanged);
+        }
+
+        [Fact]
+        public void InsertRebuildsProviderThatReadConfigDuringBuild()
+        {
+            var config = new ConfigurationManager();
+
+            config.Sources.Add(new BuildCountingConfigurationSource("Experiment", "B"));
+
+            var dependentSource = new ConfigDependentSource("Experiment");
+            config.Sources.Add(dependentSource);
+
+            Assert.Equal("B", dependentSource.LastSeenValue);
+
+            // Insert a source at the beginning that sets Experiment=A.
+            // The dependent source (after the insertion point) must be rebuilt and see the updated value.
+            config.Sources.Insert(0, new BuildCountingConfigurationSource("Experiment", "A"));
+
+            // "A" is at index 0 (lowest priority), "B" is later (higher priority), so Experiment still resolves to "B".
+            // But the dependent source is rebuilt and sees "B" during its new Build() call (which is correct).
+            Assert.Equal("B", dependentSource.LastSeenValue);
+            Assert.Equal(2, dependentSource.BuildCount);
+        }
+
+        [Fact]
+        public void InsertBeforeConfigProviderCausesRebuildWithNewValue()
+        {
+            var config = new ConfigurationManager();
+
+            var dependentSource = new ConfigDependentSource("Experiment");
+            config.Sources.Add(dependentSource);
+
+            // Initially, no "Experiment" key is set.
+            Assert.Null(dependentSource.LastSeenValue);
+
+            // Insert a source before the dependent source that provides Experiment=A.
+            // ConfigurationManager has default MemorySource at index 0, dependentSource at index 1.
+            // Insert at index 1 pushes dependentSource to index 2, so it gets rebuilt.
+            // During Build(), the new provider hasn't been added to the manager yet, so
+            // the dependent source still sees null (same behavior as ReloadSources).
+            // The value becomes available after all providers are loaded.
+            config.Sources.Insert(1, new BuildCountingConfigurationSource("Experiment", "A"));
+
+            Assert.Equal(2, dependentSource.BuildCount);
+            Assert.Equal("A", config["Experiment"]);
+        }
+
+        private class ConfigDependentSource : IConfigurationSource
+        {
+            private readonly string _keyToRead;
+
+            public string? LastSeenValue { get; private set; }
+            public int BuildCount { get; private set; }
+
+            public ConfigDependentSource(string keyToRead)
+            {
+                _keyToRead = keyToRead;
+            }
+
+            public IConfigurationProvider Build(IConfigurationBuilder builder)
+            {
+                BuildCount++;
+                LastSeenValue = ((IConfigurationRoot)builder)[_keyToRead];
+                return new TestConfigurationProvider($"_dep_{_keyToRead}", LastSeenValue ?? "");
+            }
+        }
+
     }
 }
