@@ -5,6 +5,7 @@ using System;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
 {
@@ -18,14 +19,15 @@ namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
             _serviceProvider = serviceProvider;
         }
 
-        public override Func<ServiceProviderEngineScope, object?> RealizeService(ServiceCallSite callSite)
+        public override Func<ServiceProviderEngineScope, ValueTask<object?>> RealizeService(ServiceCallSite callSite)
         {
             int callCount = 0;
             return scope =>
             {
-                // Resolve the result before we increment the call count, this ensures that singletons
-                // won't cause any side effects during the compilation of the resolve function.
-                var result = CallSiteRuntimeResolver.Instance.Resolve(callSite, scope);
+                // Resolve via the async-first runtime resolver. Since no source produces an
+                // incomplete ValueTask today, the returned task is always synchronously
+                // completed. We still return it as ValueTask<object?> to keep the pipeline uniform.
+                ValueTask<object?> resultTask = CallSiteRuntimeResolver.Instance.ResolveAsync(callSite, scope);
 
                 if (Interlocked.Increment(ref callCount) == 2)
                 {
@@ -47,7 +49,7 @@ namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
                     null);
                 }
 
-                return result;
+                return resultTask;
             };
         }
     }

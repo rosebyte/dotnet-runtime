@@ -3,6 +3,7 @@
 
 using System;
 using System.Diagnostics.CodeAnalysis;
+using System.Threading.Tasks;
 
 namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
 {
@@ -12,12 +13,9 @@ namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
 
         private RuntimeServiceProviderEngine() { }
 
-        public override Func<ServiceProviderEngineScope, object?> RealizeService(ServiceCallSite callSite)
+        public override Func<ServiceProviderEngineScope, ValueTask<object?>> RealizeService(ServiceCallSite callSite)
         {
-            return scope =>
-            {
-                return CallSiteRuntimeResolver.Instance.Resolve(callSite, scope);
-            };
+            return scope => CallSiteRuntimeResolver.Instance.ResolveAsync(callSite, scope);
         }
     }
 }

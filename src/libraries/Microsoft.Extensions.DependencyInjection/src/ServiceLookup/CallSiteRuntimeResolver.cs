@@ -9,11 +9,12 @@ using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Runtime.ExceptionServices;
 using System.Threading;
+using System.Threading.Tasks;
 using Microsoft.Extensions.Internal;
 
 namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
 {
-    internal sealed class CallSiteRuntimeResolver : CallSiteVisitor<RuntimeResolverContext, object?>
+    internal sealed class CallSiteRuntimeResolver : CallSiteVisitor<RuntimeResolverContext, ValueTask<object?>>
     {
         public static CallSiteRuntimeResolver Instance { get; } = new();
 
@@ -26,12 +27,22 @@ namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
         {
         }
 
+        // Synchronous wrapper used by the singleton fast path, the compiled
+        // (Expression / IL emit) resolvers' fallback into runtime resolution,
+        // and the public ServiceProvider entry points.
+        // Throws InvalidOperationException if the underlying async pipeline
+        // produces an incomplete ValueTask (no async sources exist today).
         public object? Resolve(ServiceCallSite callSite, ServiceProviderEngineScope scope)
+        {
+            return ValueTaskHelpers.GetSynchronousResult(ResolveAsync(callSite, scope));
+        }
+
+        public ValueTask<object?> ResolveAsync(ServiceCallSite callSite, ServiceProviderEngineScope scope)
         {
             // Fast path to avoid virtual calls if we already have the cached value in the root scope
             if (scope.IsRootScope && callSite.Value is object cached)
             {
-                return cached;
+                return new ValueTask<object?>(cached);
             }
 
             return VisitCallSite(callSite, new RuntimeResolverContext
@@ -40,27 +51,67 @@ namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
             });
         }
 
-        protected override object? VisitDisposeCache(ServiceCallSite transientCallSite, RuntimeResolverContext context)
+        protected override ValueTask<object?> VisitDisposeCache(ServiceCallSite transientCallSite, RuntimeResolverContext context)
         {
-            return context.Scope.CaptureDisposable(VisitCallSiteMain(transientCallSite, context));
+            ValueTask<object?> inner = VisitCallSiteMain(transientCallSite, context);
+            if (inner.IsCompletedSuccessfully)
+            {
+                return new ValueTask<object?>(context.Scope.CaptureDisposable(inner.Result));
+            }
+
+            return AwaitAndCapture(inner, context.Scope);
+
+            static async ValueTask<object?> AwaitAndCapture(ValueTask<object?> inner, ServiceProviderEngineScope scope)
+            {
+                object? result = await inner.ConfigureAwait(false);
+                return scope.CaptureDisposable(result);
+            }
         }
 
-        protected override object VisitConstructor(ConstructorCallSite constructorCallSite, RuntimeResolverContext context)
+        protected override ValueTask<object?> VisitConstructor(ConstructorCallSite constructorCallSite, RuntimeResolverContext context)
         {
-            object?[] parameterValues;
-            if (constructorCallSite.ParameterCallSites.Length == 0)
+            ServiceCallSite[] parameterCallSites = constructorCallSite.ParameterCallSites;
+            if (parameterCallSites.Length == 0)
             {
-                parameterValues = Array.Empty<object>();
+                return new ValueTask<object?>(InvokeConstructor(constructorCallSite, Array.Empty<object?>()));
             }
-            else
+
+            object?[] parameterValues = new object?[parameterCallSites.Length];
+            for (int index = 0; index < parameterValues.Length; index++)
             {
-                parameterValues = new object?[constructorCallSite.ParameterCallSites.Length];
-                for (int index = 0; index < parameterValues.Length; index++)
+                ValueTask<object?> parameterValueTask = VisitCallSite(parameterCallSites[index], context);
+                if (parameterValueTask.IsCompletedSuccessfully)
                 {
-                    parameterValues[index] = VisitCallSite(constructorCallSite.ParameterCallSites[index], context);
+                    parameterValues[index] = parameterValueTask.Result;
+                }
+                else
+                {
+                    return AwaitRemainingAndInvoke(constructorCallSite, parameterCallSites, parameterValues, index, parameterValueTask, context);
                 }
             }
 
+            return new ValueTask<object?>(InvokeConstructor(constructorCallSite, parameterValues));
+
+            static async ValueTask<object?> AwaitRemainingAndInvoke(
+                ConstructorCallSite constructorCallSite,
+                ServiceCallSite[] parameterCallSites,
+                object?[] parameterValues,
+                int pendingIndex,
+                ValueTask<object?> pendingValueTask,
+                RuntimeResolverContext context)
+            {
+                parameterValues[pendingIndex] = await pendingValueTask.ConfigureAwait(false);
+                for (int index = pendingIndex + 1; index < parameterValues.Length; index++)
+                {
+                    parameterValues[index] = await Instance.VisitCallSite(parameterCallSites[index], context).ConfigureAwait(false);
+                }
+
+                return InvokeConstructor(constructorCallSite, parameterValues);
+            }
+        }
+
+        private static object InvokeConstructor(ConstructorCallSite constructorCallSite, object?[] parameterValues)
+        {
 #if NETFRAMEWORK || NETSTANDARD2_0
             try
             {
@@ -77,12 +128,12 @@ namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
 #endif
         }
 
-        protected override object? VisitRootCache(ServiceCallSite callSite, RuntimeResolverContext context)
+        protected override ValueTask<object?> VisitRootCache(ServiceCallSite callSite, RuntimeResolverContext context)
         {
             if (callSite.Value is object value)
             {
                 // Value already calculated, return it directly
-                return value;
+                return new ValueTask<object?>(value);
             }
 
             var lockType = RuntimeResolverLock.Root;
@@ -93,7 +144,7 @@ namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
                 // Lock the callsite and check if another thread already cached the value
                 if (callSite.Value is object callSiteValue)
                 {
-                    return callSiteValue;
+                    return new ValueTask<object?>(callSiteValue);
                 }
 
                 // Detect circular dependencies by tracking what we're currently resolving on this thread
@@ -107,14 +158,17 @@ namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
 
                 try
                 {
-                    object? resolved = VisitCallSiteMain(callSite, new RuntimeResolverContext
+                    // We hold a lock here. Awaiting an incomplete ValueTask under the lock would
+                    // be incorrect; today no source produces incomplete tasks, so we synchronously
+                    // unwrap and rely on ValueTaskHelpers to throw if that ever changes.
+                    object? resolved = ValueTaskHelpers.GetSynchronousResult(VisitCallSiteMain(callSite, new RuntimeResolverContext
                     {
                         Scope = serviceProviderEngine,
                         AcquiredLocks = context.AcquiredLocks | lockType
-                    });
+                    }));
                     serviceProviderEngine.CaptureDisposable(resolved);
                     callSite.Value = resolved;
-                    return resolved;
+                    return new ValueTask<object?>(resolved);
                 }
                 finally
                 {
@@ -123,7 +177,7 @@ namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
             }
         }
 
-        protected override object? VisitScopeCache(ServiceCallSite callSite, RuntimeResolverContext context)
+        protected override ValueTask<object?> VisitScopeCache(ServiceCallSite callSite, RuntimeResolverContext context)
         {
             // Check if we are in the situation where scoped service was promoted to singleton
             // and we need to lock the root
@@ -132,7 +186,7 @@ namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
                 VisitCache(callSite, context, context.Scope, RuntimeResolverLock.Scope);
         }
 
-        private object? VisitCache(ServiceCallSite callSite, RuntimeResolverContext context, ServiceProviderEngineScope serviceProviderEngine, RuntimeResolverLock lockType)
+        private ValueTask<object?> VisitCache(ServiceCallSite callSite, RuntimeResolverContext context, ServiceProviderEngineScope serviceProviderEngine, RuntimeResolverLock lockType)
         {
             bool lockTaken = false;
             object sync = serviceProviderEngine.Sync;
@@ -152,17 +206,18 @@ namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
                 // For scoped: takes a dictionary as both a resolution lock and a dictionary access lock.
                 if (resolvedServices.TryGetValue(callSite.Cache.Key, out object? resolved))
                 {
-                    return resolved;
+                    return new ValueTask<object?>(resolved);
                 }
 
-                resolved = VisitCallSiteMain(callSite, new RuntimeResolverContext
+                // We hold a lock here. See note in VisitRootCache - all sources are sync today.
+                resolved = ValueTaskHelpers.GetSynchronousResult(VisitCallSiteMain(callSite, new RuntimeResolverContext
                 {
                     Scope = serviceProviderEngine,
                     AcquiredLocks = context.AcquiredLocks | lockType
-                });
+                }));
                 serviceProviderEngine.CaptureDisposable(resolved);
                 resolvedServices.Add(callSite.Cache.Key, resolved);
-                return resolved;
+                return new ValueTask<object?>(resolved);
             }
             finally
             {
@@ -173,28 +228,35 @@ namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
             }
         }
 
-        protected override object? VisitConstant(ConstantCallSite constantCallSite, RuntimeResolverContext context)
+        protected override ValueTask<object?> VisitConstant(ConstantCallSite constantCallSite, RuntimeResolverContext context)
         {
-            return constantCallSite.DefaultValue;
+            return new ValueTask<object?>(constantCallSite.DefaultValue);
         }
 
-        protected override object VisitServiceProvider(ServiceProviderCallSite serviceProviderCallSite, RuntimeResolverContext context)
+        protected override ValueTask<object?> VisitServiceProvider(ServiceProviderCallSite serviceProviderCallSite, RuntimeResolverContext context)
         {
-            return context.Scope;
+            return new ValueTask<object?>(context.Scope);
         }
 
-        protected override object VisitIEnumerable(IEnumerableCallSite enumerableCallSite, RuntimeResolverContext context)
+        protected override ValueTask<object?> VisitIEnumerable(IEnumerableCallSite enumerableCallSite, RuntimeResolverContext context)
         {
-            Array array = CreateArray(
-                enumerableCallSite.ItemType,
-                enumerableCallSite.ServiceCallSites.Length);
+            ServiceCallSite[] itemCallSites = enumerableCallSite.ServiceCallSites;
+            Array array = CreateArray(enumerableCallSite.ItemType, itemCallSites.Length);
 
-            for (int index = 0; index < enumerableCallSite.ServiceCallSites.Length; index++)
+            for (int index = 0; index < itemCallSites.Length; index++)
             {
-                object? value = VisitCallSite(enumerableCallSite.ServiceCallSites[index], context);
-                array.SetValue(value, index);
+                ValueTask<object?> itemValueTask = VisitCallSite(itemCallSites[index], context);
+                if (itemValueTask.IsCompletedSuccessfully)
+                {
+                    array.SetValue(itemValueTask.Result, index);
+                }
+                else
+                {
+                    return AwaitRemaining(array, itemCallSites, index, itemValueTask, context);
+                }
             }
-            return array;
+
+            return new ValueTask<object?>(array);
 
             [UnconditionalSuppressMessage("AotAnalysis", "IL3050:RequiresDynamicCode",
                 Justification = "VerifyAotCompatibility ensures elementType is not a ValueType")]
@@ -204,11 +266,27 @@ namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
 
                 return Array.CreateInstance(elementType, length);
             }
+
+            static async ValueTask<object?> AwaitRemaining(
+                Array array,
+                ServiceCallSite[] itemCallSites,
+                int pendingIndex,
+                ValueTask<object?> pendingValueTask,
+                RuntimeResolverContext context)
+            {
+                array.SetValue(await pendingValueTask.ConfigureAwait(false), pendingIndex);
+                for (int index = pendingIndex + 1; index < itemCallSites.Length; index++)
+                {
+                    array.SetValue(await Instance.VisitCallSite(itemCallSites[index], context).ConfigureAwait(false), index);
+                }
+
+                return array;
+            }
         }
 
-        protected override object VisitFactory(FactoryCallSite factoryCallSite, RuntimeResolverContext context)
+        protected override ValueTask<object?> VisitFactory(FactoryCallSite factoryCallSite, RuntimeResolverContext context)
         {
-            return factoryCallSite.Factory(context.Scope);
+            return new ValueTask<object?>(factoryCallSite.Factory(context.Scope));
         }
     }
 

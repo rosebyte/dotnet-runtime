@@ -228,7 +228,9 @@ namespace Microsoft.Extensions.DependencyInjection
             ServiceAccessor serviceAccessor = _serviceAccessors.GetOrAdd(serviceIdentifier, _createServiceAccessor);
             OnResolve(serviceAccessor.CallSite, serviceProviderEngineScope);
             DependencyInjectionEventSource.Log.ServiceResolved(this, serviceIdentifier.ServiceType);
-            object? result = serviceAccessor.RealizedService?.Invoke(serviceProviderEngineScope);
+            object? result = serviceAccessor.RealizedService is { } realized
+                ? ServiceLookup.ValueTaskHelpers.GetSynchronousResult(realized(serviceProviderEngineScope))
+                : null;
             System.Diagnostics.Debug.Assert(result is null || CallSiteFactory.IsService(serviceIdentifier));
             return result;
         }
@@ -266,16 +268,16 @@ namespace Microsoft.Extensions.DependencyInjection
                 if (callSite.Cache.Location == CallSiteResultCacheLocation.Root)
                 {
                     object? value = CallSiteRuntimeResolver.Instance.Resolve(callSite, Root);
-                    return new ServiceAccessor { CallSite = callSite, RealizedService = scope => value };
+                    return new ServiceAccessor { CallSite = callSite, RealizedService = scope => new ValueTask<object?>(value) };
                 }
 
-                Func<ServiceProviderEngineScope, object?> realizedService = _engine.RealizeService(callSite);
+                Func<ServiceProviderEngineScope, ValueTask<object?>> realizedService = _engine.RealizeService(callSite);
                 return new ServiceAccessor { CallSite = callSite, RealizedService = realizedService };
             }
-            return new ServiceAccessor { CallSite = callSite, RealizedService = _ => null };
+            return new ServiceAccessor { CallSite = callSite, RealizedService = _ => default };
         }
 
-        internal void ReplaceServiceAccessor(ServiceCallSite callSite, Func<ServiceProviderEngineScope, object?> accessor)
+        internal void ReplaceServiceAccessor(ServiceCallSite callSite, Func<ServiceProviderEngineScope, ValueTask<object?>> accessor)
         {
             _serviceAccessors[new ServiceIdentifier(callSite.Key, callSite.ServiceType)] = new ServiceAccessor
             {
@@ -338,7 +340,7 @@ namespace Microsoft.Extensions.DependencyInjection
         private sealed class ServiceAccessor
         {
             public ServiceCallSite? CallSite { get; set; }
-            public Func<ServiceProviderEngineScope, object?>? RealizedService { get; set; }
+            public Func<ServiceProviderEngineScope, ValueTask<object?>>? RealizedService { get; set; }
         }
     }
 }

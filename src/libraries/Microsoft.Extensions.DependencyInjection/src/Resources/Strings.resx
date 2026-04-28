@@ -198,4 +198,7 @@
   <data name="NoKeyedServiceRegistered" xml:space="preserve">
     <value>No keyed service for type '{0}' using key type '{1}' has been registered.</value>
   </data>
+  <data name="AsynchronousResolutionNotSupported" xml:space="preserve">
+    <value>The dependency injection container does not support resolving services asynchronously. A service produced a result that was not synchronously available.</value>
+  </data>
 </root>
