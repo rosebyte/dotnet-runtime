@@ -479,7 +479,8 @@ namespace Microsoft.Extensions.DependencyInjection.Tests
 
         private static Func<ServiceProviderEngineScope, object> CompileCallSite(ServiceCallSite callSite, ServiceProvider provider)
         {
-            return new ExpressionResolverBuilder(provider).Build(callSite);
+            var compiled = new ExpressionResolverBuilder(provider).Build(callSite);
+            return scope => ValueTaskHelpers.GetSynchronousResult(compiled(scope));
         }
     }
 }

@@ -9,6 +9,7 @@ using System.Diagnostics.CodeAnalysis;
 using System.Reflection;
 using System.Reflection.Emit;
 using System.Runtime.InteropServices;
+using System.Threading.Tasks;
 
 namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
 {
@@ -24,8 +25,8 @@ namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
         private static readonly MethodInfo ScopeIsRootScope = typeof(ServiceProviderEngineScope).GetProperty(
             nameof(ServiceProviderEngineScope.IsRootScope), BindingFlags.Instance | BindingFlags.Public)!.GetMethod!;
 
-        private static readonly MethodInfo CallSiteRuntimeResolverResolveMethod = typeof(CallSiteRuntimeResolver).GetMethod(
-            nameof(CallSiteRuntimeResolver.Resolve), BindingFlags.Public | BindingFlags.Instance)!;
+        private static readonly MethodInfo CallSiteRuntimeResolverResolveAsyncMethod = typeof(CallSiteRuntimeResolver).GetMethod(
+            nameof(CallSiteRuntimeResolver.ResolveAsync), BindingFlags.Public | BindingFlags.Instance)!;
 
         private static readonly MethodInfo CallSiteRuntimeResolverInstanceField = typeof(CallSiteRuntimeResolver).GetProperty(
             nameof(CallSiteRuntimeResolver.Instance), BindingFlags.Static | BindingFlags.Public | BindingFlags.Instance)!.GetMethod!;
@@ -36,6 +37,29 @@ namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
 
         private static readonly ConstructorInfo CacheKeyCtor = typeof(ServiceCacheKey).GetConstructors()[0];
 
+        // ValueTask<object?> reflection
+        private static readonly ConstructorInfo ValueTaskObjectCtor =
+            typeof(ValueTask<object?>).GetConstructor(new[] { typeof(object) })!;
+
+        private static readonly MethodInfo ValueTaskIsCompletedSuccessfullyGetter =
+            typeof(ValueTask<object?>).GetProperty(nameof(ValueTask<object?>.IsCompletedSuccessfully))!.GetMethod!;
+
+        private static readonly MethodInfo ValueTaskResultGetter =
+            typeof(ValueTask<object?>).GetProperty(nameof(ValueTask<object?>.Result))!.GetMethod!;
+
+        private static readonly MethodInfo GetSynchronousResultObjectMethod =
+            typeof(ValueTaskHelpers).GetMethod(nameof(ValueTaskHelpers.GetSynchronousResult))!
+                .MakeGenericMethod(typeof(object));
+
+        private static readonly MethodInfo AwaitConstructorMethod =
+            typeof(ValueTaskHelpers).GetMethod(nameof(ValueTaskHelpers.AwaitConstructor), BindingFlags.NonPublic | BindingFlags.Static)!;
+
+        private static readonly MethodInfo AwaitArrayElementsMethod =
+            typeof(ValueTaskHelpers).GetMethod(nameof(ValueTaskHelpers.AwaitArrayElements), BindingFlags.NonPublic | BindingFlags.Static)!;
+
+        private static readonly MethodInfo AwaitAndCaptureDisposableMethod =
+            typeof(ValueTaskHelpers).GetMethod(nameof(ValueTaskHelpers.AwaitAndCaptureDisposable), BindingFlags.NonPublic | BindingFlags.Static)!;
+
         private sealed class ILEmitResolverBuilderRuntimeContext
         {
             public object?[]? Constants;
@@ -44,7 +68,7 @@ namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
 
         private struct GeneratedMethod
         {
-            public Func<ServiceProviderEngineScope, object?> Lambda;
+            public Func<ServiceProviderEngineScope, ValueTask<object?>> Lambda;
 
             public ILEmitResolverBuilderRuntimeContext Context;
             public DynamicMethod DynamicMethod;
@@ -63,7 +87,7 @@ namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
             _buildTypeDelegate = (key, cs) => BuildTypeNoCache(cs);
         }
 
-        public Func<ServiceProviderEngineScope, object?> Build(ServiceCallSite callSite)
+        public Func<ServiceProviderEngineScope, ValueTask<object?>> Build(ServiceCallSite callSite)
         {
             return BuildType(callSite).Lambda;
         }
@@ -89,7 +113,7 @@ namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
             var dynamicMethod = new DynamicMethod("ResolveService",
                 attributes: MethodAttributes.Public | MethodAttributes.Static,
                 callingConvention: CallingConventions.Standard,
-                returnType: typeof(object),
+                returnType: typeof(ValueTask<object?>),
                 parameterTypes: new[] { typeof(ILEmitResolverBuilderRuntimeContext), typeof(ServiceProviderEngineScope) },
                 owner: GetType(),
                 skipVisibility: true);
@@ -114,7 +138,7 @@ namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
             var type = module.DefineType(callSite.ServiceType.Name + "Resolver");
 
             var method = type.DefineMethod(
-                "ResolveService", MethodAttributes.Public | MethodAttributes.Static, CallingConventions.Standard, typeof(object),
+                "ResolveService", MethodAttributes.Public | MethodAttributes.Static, CallingConventions.Standard, typeof(ValueTask<object?>),
                 new[] { typeof(ILEmitResolverBuilderRuntimeContext), typeof(ServiceProviderEngineScope) });
 
             GenerateMethodBody(callSite, method.GetILGenerator());
@@ -125,7 +149,7 @@ namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
 
             return new GeneratedMethod()
             {
-                Lambda = (Func<ServiceProviderEngineScope, object?>)dynamicMethod.CreateDelegate(typeof(Func<ServiceProviderEngineScope, object?>), runtimeContext),
+                Lambda = (Func<ServiceProviderEngineScope, ValueTask<object?>>)dynamicMethod.CreateDelegate(typeof(Func<ServiceProviderEngineScope, ValueTask<object?>>), runtimeContext),
                 Context = runtimeContext,
                 DynamicMethod = dynamicMethod
             };
@@ -134,43 +158,128 @@ namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
 
         protected override object? VisitDisposeCache(ServiceCallSite transientCallSite, ILEmitResolverBuilderContext argument)
         {
-            if (transientCallSite.CaptureDisposable)
+            ILGenerator il = argument.Generator;
+
+            VisitCallSiteMain(transientCallSite, argument);
+            // Stack: [ValueTask<object?>]
+
+            if (!transientCallSite.CaptureDisposable)
             {
-                BeginCaptureDisposable(argument);
-                VisitCallSiteMain(transientCallSite, argument);
-                EndCaptureDisposable(argument);
+                return null;
             }
-            else
-            {
-                VisitCallSiteMain(transientCallSite, argument);
-            }
+
+            LocalBuilder vtLocal = il.DeclareLocal(typeof(ValueTask<object?>));
+            il.Emit(OpCodes.Stloc, vtLocal);
+
+            Label slowPath = il.DefineLabel();
+            Label returnLabel = il.DefineLabel();
+
+            il.Emit(OpCodes.Ldloca, vtLocal);
+            il.Emit(OpCodes.Call, ValueTaskIsCompletedSuccessfullyGetter);
+            il.Emit(OpCodes.Brfalse, slowPath);
+
+            // Fast path: scope.CaptureDisposable(vt.Result), wrap in ValueTask
+            il.Emit(OpCodes.Ldarg_1);
+            il.Emit(OpCodes.Ldloca, vtLocal);
+            il.Emit(OpCodes.Call, ValueTaskResultGetter);
+            il.Emit(OpCodes.Callvirt, ServiceLookupHelpers.CaptureDisposableMethodInfo);
+            il.Emit(OpCodes.Newobj, ValueTaskObjectCtor);
+            il.Emit(OpCodes.Br, returnLabel);
+
+            // Slow path: AwaitAndCaptureDisposable(vt, scope)
+            il.MarkLabel(slowPath);
+            il.Emit(OpCodes.Ldloc, vtLocal);
+            il.Emit(OpCodes.Ldarg_1);
+            il.Emit(OpCodes.Call, AwaitAndCaptureDisposableMethod);
+
+            il.MarkLabel(returnLabel);
+            // Stack: [ValueTask<object?>]
             return null;
         }
 
         protected override object? VisitConstructor(ConstructorCallSite constructorCallSite, ILEmitResolverBuilderContext argument)
         {
-            // new T([create arguments])
-            foreach (ServiceCallSite parameterCallSite in constructorCallSite.ParameterCallSites)
+            ILGenerator il = argument.Generator;
+            ServiceCallSite[] paramCallSites = constructorCallSite.ParameterCallSites;
+
+            if (paramCallSites.Length == 0)
             {
-                VisitCallSite(parameterCallSite, argument);
-                if (parameterCallSite.ServiceType.IsValueType)
+                il.Emit(OpCodes.Newobj, constructorCallSite.ConstructorInfo);
+                if (constructorCallSite.ImplementationType!.IsValueType)
                 {
-                    argument.Generator.Emit(OpCodes.Unbox_Any, parameterCallSite.ServiceType);
+                    il.Emit(OpCodes.Box, constructorCallSite.ImplementationType);
+                }
+                il.Emit(OpCodes.Newobj, ValueTaskObjectCtor);
+                return null;
+            }
+
+            // Declare locals for each parameter's ValueTask
+            LocalBuilder[] vtLocals = new LocalBuilder[paramCallSites.Length];
+            for (int i = 0; i < paramCallSites.Length; i++)
+            {
+                vtLocals[i] = il.DeclareLocal(typeof(ValueTask<object?>));
+            }
+
+            // Resolve each parameter → ValueTask<object?>, store in local
+            for (int i = 0; i < paramCallSites.Length; i++)
+            {
+                VisitCallSite(paramCallSites[i], argument);
+                il.Emit(OpCodes.Stloc, vtLocals[i]);
+            }
+
+            Label slowPath = il.DefineLabel();
+            Label returnLabel = il.DefineLabel();
+
+            // Check all IsCompletedSuccessfully
+            for (int i = 0; i < paramCallSites.Length; i++)
+            {
+                il.Emit(OpCodes.Ldloca, vtLocals[i]);
+                il.Emit(OpCodes.Call, ValueTaskIsCompletedSuccessfullyGetter);
+                il.Emit(OpCodes.Brfalse, slowPath);
+            }
+
+            // Fast path: extract .Result, cast, construct, wrap in ValueTask
+            for (int i = 0; i < paramCallSites.Length; i++)
+            {
+                il.Emit(OpCodes.Ldloca, vtLocals[i]);
+                il.Emit(OpCodes.Call, ValueTaskResultGetter);
+                if (paramCallSites[i].ServiceType.IsValueType)
+                {
+                    il.Emit(OpCodes.Unbox_Any, paramCallSites[i].ServiceType);
                 }
             }
-
-            argument.Generator.Emit(OpCodes.Newobj, constructorCallSite.ConstructorInfo);
+            il.Emit(OpCodes.Newobj, constructorCallSite.ConstructorInfo);
             if (constructorCallSite.ImplementationType!.IsValueType)
             {
-                argument.Generator.Emit(OpCodes.Box, constructorCallSite.ImplementationType);
+                il.Emit(OpCodes.Box, constructorCallSite.ImplementationType);
             }
+            il.Emit(OpCodes.Newobj, ValueTaskObjectCtor);
+            il.Emit(OpCodes.Br, returnLabel);
 
+            // Slow path: create ValueTask<object?>[] array, call AwaitConstructor
+            il.MarkLabel(slowPath);
+            AddConstant(argument, constructorCallSite.ConstructorInfo);
+            il.Emit(OpCodes.Castclass, typeof(ConstructorInfo));
+            il.Emit(OpCodes.Ldc_I4, paramCallSites.Length);
+            il.Emit(OpCodes.Newarr, typeof(ValueTask<object?>));
+            for (int i = 0; i < paramCallSites.Length; i++)
+            {
+                il.Emit(OpCodes.Dup);
+                il.Emit(OpCodes.Ldc_I4, i);
+                il.Emit(OpCodes.Ldloc, vtLocals[i]);
+                il.Emit(OpCodes.Stelem, typeof(ValueTask<object?>));
+            }
+            il.Emit(OpCodes.Call, AwaitConstructorMethod);
+
+            il.MarkLabel(returnLabel);
+            // Stack: [ValueTask<object?>]
             return null;
         }
 
         protected override object? VisitRootCache(ServiceCallSite callSite, ILEmitResolverBuilderContext argument)
         {
             AddConstant(argument, CallSiteRuntimeResolver.Instance.Resolve(callSite, _rootScope));
+            argument.Generator.Emit(OpCodes.Newobj, ValueTaskObjectCtor);
             return null;
         }
 
@@ -190,13 +299,14 @@ namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
             argument.Generator.Emit(OpCodes.Ldarg_1);
             argument.Generator.Emit(OpCodes.Call, generatedMethod.DynamicMethod);
 #endif
-
+            // Stack: [ValueTask<object?>]
             return null;
         }
 
         protected override object? VisitConstant(ConstantCallSite constantCallSite, ILEmitResolverBuilderContext argument)
         {
             AddConstant(argument, constantCallSite.DefaultValue);
+            argument.Generator.Emit(OpCodes.Newobj, ValueTaskObjectCtor);
             return null;
         }
 
@@ -204,42 +314,83 @@ namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
         {
             // [return] ProviderScope
             argument.Generator.Emit(OpCodes.Ldarg_1);
+            argument.Generator.Emit(OpCodes.Newobj, ValueTaskObjectCtor);
             return null;
         }
 
         protected override object? VisitIEnumerable(IEnumerableCallSite enumerableCallSite, ILEmitResolverBuilderContext argument)
         {
+            ILGenerator il = argument.Generator;
+
             if (enumerableCallSite.ServiceCallSites.Length == 0)
             {
-                argument.Generator.Emit(OpCodes.Call, ServiceLookupHelpers.GetArrayEmptyMethodInfo(enumerableCallSite.ItemType));
+                il.Emit(OpCodes.Call, ServiceLookupHelpers.GetArrayEmptyMethodInfo(enumerableCallSite.ItemType));
+                il.Emit(OpCodes.Newobj, ValueTaskObjectCtor);
+                return null;
             }
-            else
+
+            int count = enumerableCallSite.ServiceCallSites.Length;
+
+            // Declare locals for each element's ValueTask
+            LocalBuilder[] vtLocals = new LocalBuilder[count];
+            for (int i = 0; i < count; i++)
             {
-                // var array = new ItemType[];
-                // array[0] = [Create argument0];
-                // array[1] = [Create argument1];
-                // ...
-                argument.Generator.Emit(OpCodes.Ldc_I4, enumerableCallSite.ServiceCallSites.Length);
-                argument.Generator.Emit(OpCodes.Newarr, enumerableCallSite.ItemType);
-                for (int i = 0; i < enumerableCallSite.ServiceCallSites.Length; i++)
-                {
-                    // duplicate array
-                    argument.Generator.Emit(OpCodes.Dup);
-                    // push index
-                    argument.Generator.Emit(OpCodes.Ldc_I4, i);
-                    // create parameter
-                    ServiceCallSite parameterCallSite = enumerableCallSite.ServiceCallSites[i];
-                    VisitCallSite(parameterCallSite, argument);
-                    if (parameterCallSite.ServiceType.IsValueType)
-                    {
-                        argument.Generator.Emit(OpCodes.Unbox_Any, parameterCallSite.ServiceType);
-                    }
-
-                    // store
-                    argument.Generator.Emit(OpCodes.Stelem, enumerableCallSite.ItemType);
-                }
+                vtLocals[i] = il.DeclareLocal(typeof(ValueTask<object?>));
             }
 
+            // Resolve each element → ValueTask<object?>, store in local
+            for (int i = 0; i < count; i++)
+            {
+                VisitCallSite(enumerableCallSite.ServiceCallSites[i], argument);
+                il.Emit(OpCodes.Stloc, vtLocals[i]);
+            }
+
+            Label slowPath = il.DefineLabel();
+            Label returnLabel = il.DefineLabel();
+
+            // Check all IsCompletedSuccessfully
+            for (int i = 0; i < count; i++)
+            {
+                il.Emit(OpCodes.Ldloca, vtLocals[i]);
+                il.Emit(OpCodes.Call, ValueTaskIsCompletedSuccessfullyGetter);
+                il.Emit(OpCodes.Brfalse, slowPath);
+            }
+
+            // Fast path: create typed array with extracted results, wrap in ValueTask
+            il.Emit(OpCodes.Ldc_I4, count);
+            il.Emit(OpCodes.Newarr, enumerableCallSite.ItemType);
+            for (int i = 0; i < count; i++)
+            {
+                il.Emit(OpCodes.Dup);
+                il.Emit(OpCodes.Ldc_I4, i);
+                il.Emit(OpCodes.Ldloca, vtLocals[i]);
+                il.Emit(OpCodes.Call, ValueTaskResultGetter);
+                if (enumerableCallSite.ServiceCallSites[i].ServiceType.IsValueType)
+                {
+                    il.Emit(OpCodes.Unbox_Any, enumerableCallSite.ServiceCallSites[i].ServiceType);
+                }
+                il.Emit(OpCodes.Stelem, enumerableCallSite.ItemType);
+            }
+            il.Emit(OpCodes.Newobj, ValueTaskObjectCtor);
+            il.Emit(OpCodes.Br, returnLabel);
+
+            // Slow path: create ValueTask array, call AwaitArrayElements
+            il.MarkLabel(slowPath);
+            AddConstant(argument, enumerableCallSite.ItemType);
+            il.Emit(OpCodes.Castclass, typeof(Type));
+            il.Emit(OpCodes.Ldc_I4, count);
+            il.Emit(OpCodes.Newarr, typeof(ValueTask<object?>));
+            for (int i = 0; i < count; i++)
+            {
+                il.Emit(OpCodes.Dup);
+                il.Emit(OpCodes.Ldc_I4, i);
+                il.Emit(OpCodes.Ldloc, vtLocals[i]);
+                il.Emit(OpCodes.Stelem, typeof(ValueTask<object?>));
+            }
+            il.Emit(OpCodes.Call, AwaitArrayElementsMethod);
+
+            il.MarkLabel(returnLabel);
+            // Stack: [ValueTask<object?>]
             return null;
         }
 
@@ -256,6 +407,7 @@ namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
 
             argument.Generator.Emit(OpCodes.Ldarg_1);
             argument.Generator.Emit(OpCodes.Call, ServiceLookupHelpers.InvokeFactoryMethodInfo);
+            argument.Generator.Emit(OpCodes.Newobj, ValueTaskObjectCtor);
 
             argument.Factories.Add(factoryCallSite.Factory);
             return null;
@@ -296,7 +448,7 @@ namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
 
             // if (scope.IsRootScope)
             // {
-            //    return CallSiteRuntimeResolver.Instance.Resolve(callSite, scope);
+            //    return CallSiteRuntimeResolver.Instance.ResolveAsync(callSite, scope);
             // }
             // var cacheKey = scopedCallSite.CacheKey;
             // object sync;
@@ -309,7 +461,8 @@ namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
             //    Monitor.Enter(sync, ref lockTaken);
             //    if (!resolvedServices.TryGetValue(cacheKey, out result)
             //    {
-            //       result = [createvalue];
+            //       ValueTask<object?> vt = [createvalue];
+            //       result = ValueTaskHelpers.GetSynchronousResult(vt);
             //       CaptureDisposable(result);
             //       resolvedServices.Add(cacheKey, result);
             //    }
@@ -321,7 +474,7 @@ namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
             //      Monitor.Exit(sync);
             //   }
             // }
-            // return result;
+            // return new ValueTask<object?>(result);
 
             if (callSite.Cache.Location == CallSiteResultCacheLocation.Scope)
             {
@@ -340,10 +493,11 @@ namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
                 context.Generator.Emit(OpCodes.Callvirt, ScopeIsRootScope);
                 context.Generator.Emit(OpCodes.Brfalse_S, defaultLabel);
 
+                // Root scope: return RuntimeResolver.Instance.ResolveAsync(callSite, scope)
                 context.Generator.Emit(OpCodes.Call, CallSiteRuntimeResolverInstanceField);
                 AddConstant(context, callSite);
                 context.Generator.Emit(OpCodes.Ldarg_1);
-                context.Generator.Emit(OpCodes.Callvirt, CallSiteRuntimeResolverResolveMethod);
+                context.Generator.Emit(OpCodes.Callvirt, CallSiteRuntimeResolverResolveAsyncMethod);
                 context.Generator.Emit(OpCodes.Ret);
 
                 // Generate cache key
@@ -387,8 +541,10 @@ namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
                 // Jump to the end if already in cache
                 context.Generator.Emit(OpCodes.Brtrue, skipCreationLabel);
 
-                // Create value
+                // Create value — VisitCallSiteMain pushes ValueTask<object?> on stack
                 VisitCallSiteMain(callSite, context);
+                // Unwrap synchronously: GetSynchronousResult(vt) → object?
+                context.Generator.Emit(OpCodes.Call, GetSynchronousResultObjectMethod);
                 context.Generator.Emit(OpCodes.Stloc, resultLocal);
 
                 if (callSite.CaptureDisposable)
@@ -426,14 +582,16 @@ namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
 
                 context.Generator.EndExceptionBlock();
 
-                // load value
+                // load value and wrap in ValueTask
                 context.Generator.Emit(OpCodes.Ldloc, resultLocal);
+                context.Generator.Emit(OpCodes.Newobj, ValueTaskObjectCtor);
                 // return
                 context.Generator.Emit(OpCodes.Ret);
             }
             else
             {
                 VisitCallSite(callSite, context);
+                // Stack: [ValueTask<object?>]
                 // return
                 context.Generator.Emit(OpCodes.Ret);
             }
@@ -452,7 +610,7 @@ namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
 
         private static void EndCaptureDisposable(ILEmitResolverBuilderContext argument)
         {
-            // When calling CaptureDisposable we expect callee and arguments to be on the stackcontext.Generator.BeginExceptionBlock
+            // When calling CaptureDisposable we expect callee and arguments to be on the stack
             argument.Generator.Emit(OpCodes.Callvirt, ServiceLookupHelpers.CaptureDisposableMethodInfo);
         }
     }

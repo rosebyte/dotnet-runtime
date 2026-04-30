@@ -19,8 +19,7 @@ namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
 
         public override Func<ServiceProviderEngineScope, ValueTask<object?>> RealizeService(ServiceCallSite callSite)
         {
-            Func<ServiceProviderEngineScope, object?> compiled = _expressionResolverBuilder.Build(callSite);
-            return scope => new ValueTask<object?>(compiled(scope));
+            return _expressionResolverBuilder.Build(callSite);
         }
     }
 }

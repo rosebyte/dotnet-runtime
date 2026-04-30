@@ -26,6 +26,9 @@ namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
         internal static readonly MethodInfo ResolveCallSiteAndScopeMethodInfo = typeof(CallSiteRuntimeResolver)
             .GetMethod(nameof(CallSiteRuntimeResolver.Resolve), LookupFlags)!;
 
+        internal static readonly MethodInfo ResolveAsyncCallSiteAndScopeMethodInfo = typeof(CallSiteRuntimeResolver)
+            .GetMethod(nameof(CallSiteRuntimeResolver.ResolveAsync), LookupFlags)!;
+
         internal static readonly MethodInfo AddMethodInfo = typeof(IDictionary<ServiceCacheKey, object>)
             .GetMethod(nameof(IDictionary<ServiceCacheKey, object>.Add), LookupFlags)!;
 

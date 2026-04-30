@@ -179,7 +179,7 @@ namespace Microsoft.Extensions.DependencyInjection.Tests
             var expressionTreeGeneratedEvent = Listener.EventDataFor(serviceProvider).Single(e => e.EventName == "ExpressionTreeGenerated");
 
             Assert.Equal("Microsoft.Extensions.DependencyInjection.Specification.Fakes.IFakeService", GetProperty<string>(expressionTreeGeneratedEvent, "serviceType"));
-            Assert.Equal(9, GetProperty<int>(expressionTreeGeneratedEvent, "nodeCount"));
+            Assert.Equal(20, GetProperty<int>(expressionTreeGeneratedEvent, "nodeCount"));
             Assert.Equal(3, expressionTreeGeneratedEvent.EventId);
         }
 
@@ -197,7 +197,7 @@ namespace Microsoft.Extensions.DependencyInjection.Tests
             var expressionTreeGeneratedEvent = Listener.EventDataFor(serviceProvider).Single(e => e.EventName == "DynamicMethodBuilt");
 
             Assert.Equal("Microsoft.Extensions.DependencyInjection.Specification.Fakes.IFakeService", GetProperty<string>(expressionTreeGeneratedEvent, "serviceType"));
-            Assert.Equal(12, GetProperty<int>(expressionTreeGeneratedEvent, "methodSize"));
+            Assert.Equal(54, GetProperty<int>(expressionTreeGeneratedEvent, "methodSize"));
             Assert.Equal(4, expressionTreeGeneratedEvent.EventId);
         }
 

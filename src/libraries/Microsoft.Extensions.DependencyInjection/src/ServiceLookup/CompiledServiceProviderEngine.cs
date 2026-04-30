@@ -23,11 +23,7 @@ namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
 
         public override Func<ServiceProviderEngineScope, ValueTask<object?>> RealizeService(ServiceCallSite callSite)
         {
-            // The compiled (Expression / IL emit) pipeline still produces a synchronous
-            // Func<scope, object?>; wrap it into the async-first signature here so the
-            // rest of the resolution pipeline stays uniform.
-            Func<ServiceProviderEngineScope, object?> compiled = ResolverBuilder.Build(callSite);
-            return scope => new ValueTask<object?>(compiled(scope));
+            return ResolverBuilder.Build(callSite);
         }
     }
 }

@@ -9,6 +9,7 @@ using System.Diagnostics.CodeAnalysis;
 using System.Linq;
 using System.Linq.Expressions;
 using System.Reflection;
+using System.Threading.Tasks;
 
 namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
 {
@@ -30,32 +31,48 @@ namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
                     ScopeParameter,
                     typeof(ServiceProviderEngineScope).GetProperty(nameof(ServiceProviderEngineScope.Sync), BindingFlags.Instance | BindingFlags.NonPublic)!));
 
-        private static readonly ParameterExpression CaptureDisposableParameter = Expression.Parameter(typeof(object));
-        private static readonly LambdaExpression CaptureDisposable = Expression.Lambda(
-                    delegateType: typeof(Func<object?, object?>),
-                    Expression.Call(ScopeParameter, ServiceLookupHelpers.CaptureDisposableMethodInfo, CaptureDisposableParameter),
-                    CaptureDisposableParameter);
-
         private static readonly ConstantExpression CallSiteRuntimeResolverInstanceExpression = Expression.Constant(
             CallSiteRuntimeResolver.Instance,
             typeof(CallSiteRuntimeResolver));
 
+        // ValueTask<object?> reflection
+        private static readonly ConstructorInfo ValueTaskObjectCtor =
+            typeof(ValueTask<object?>).GetConstructor(new[] { typeof(object) })!;
+
+        private static readonly PropertyInfo ValueTaskIsCompletedSuccessfullyProp =
+            typeof(ValueTask<object?>).GetProperty(nameof(ValueTask<object?>.IsCompletedSuccessfully))!;
+
+        private static readonly PropertyInfo ValueTaskResultProp =
+            typeof(ValueTask<object?>).GetProperty(nameof(ValueTask<object?>.Result))!;
+
+        private static readonly MethodInfo GetSynchronousResultObjectMethod =
+            typeof(ValueTaskHelpers).GetMethod(nameof(ValueTaskHelpers.GetSynchronousResult))!
+                .MakeGenericMethod(typeof(object));
+
+        private static readonly MethodInfo AwaitConstructorMethod =
+            typeof(ValueTaskHelpers).GetMethod(nameof(ValueTaskHelpers.AwaitConstructor), BindingFlags.NonPublic | BindingFlags.Static)!;
+
+        private static readonly MethodInfo AwaitArrayElementsMethod =
+            typeof(ValueTaskHelpers).GetMethod(nameof(ValueTaskHelpers.AwaitArrayElements), BindingFlags.NonPublic | BindingFlags.Static)!;
+
+        private static readonly MethodInfo AwaitAndCaptureDisposableMethod =
+            typeof(ValueTaskHelpers).GetMethod(nameof(ValueTaskHelpers.AwaitAndCaptureDisposable), BindingFlags.NonPublic | BindingFlags.Static)!;
+
         private readonly ServiceProviderEngineScope _rootScope;
 
-        private readonly ConcurrentDictionary<ServiceCacheKey, Func<ServiceProviderEngineScope, object>> _scopeResolverCache;
+        private readonly ConcurrentDictionary<ServiceCacheKey, Func<ServiceProviderEngineScope, ValueTask<object?>>> _scopeResolverCache;
 
-        private readonly Func<ServiceCacheKey, ServiceCallSite, Func<ServiceProviderEngineScope, object>> _buildTypeDelegate;
+        private readonly Func<ServiceCacheKey, ServiceCallSite, Func<ServiceProviderEngineScope, ValueTask<object?>>> _buildTypeDelegate;
 
         public ExpressionResolverBuilder(ServiceProvider serviceProvider)
         {
             _rootScope = serviceProvider.Root;
-            _scopeResolverCache = new ConcurrentDictionary<ServiceCacheKey, Func<ServiceProviderEngineScope, object>>();
+            _scopeResolverCache = new ConcurrentDictionary<ServiceCacheKey, Func<ServiceProviderEngineScope, ValueTask<object?>>>();
             _buildTypeDelegate = (key, cs) => BuildNoCache(cs);
         }
 
-        public Func<ServiceProviderEngineScope, object> Build(ServiceCallSite callSite)
+        public Func<ServiceProviderEngineScope, ValueTask<object?>> Build(ServiceCallSite callSite)
         {
-            // Only scope methods are cached
             if (callSite.Cache.Location == CallSiteResultCacheLocation.Scope)
             {
 #if NETFRAMEWORK || NETSTANDARD2_0
@@ -68,18 +85,18 @@ namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
             return BuildNoCache(callSite);
         }
 
-        public Func<ServiceProviderEngineScope, object> BuildNoCache(ServiceCallSite callSite)
+        private Func<ServiceProviderEngineScope, ValueTask<object?>> BuildNoCache(ServiceCallSite callSite)
         {
-            Expression<Func<ServiceProviderEngineScope, object>> expression = BuildExpression(callSite);
+            Expression<Func<ServiceProviderEngineScope, ValueTask<object?>>> expression = BuildExpression(callSite);
             DependencyInjectionEventSource.Log.ExpressionTreeGenerated(_rootScope.RootProvider, callSite.ServiceType, expression);
             return expression.Compile();
         }
 
-        private Expression<Func<ServiceProviderEngineScope, object>> BuildExpression(ServiceCallSite callSite)
+        private Expression<Func<ServiceProviderEngineScope, ValueTask<object?>>> BuildExpression(ServiceCallSite callSite)
         {
             if (callSite.Cache.Location == CallSiteResultCacheLocation.Scope)
             {
-                return Expression.Lambda<Func<ServiceProviderEngineScope, object>>(
+                return Expression.Lambda<Func<ServiceProviderEngineScope, ValueTask<object?>>>(
                     Expression.Block(
                         new[] { ResolvedServices, Sync },
                         ResolvedServicesVariableAssignment,
@@ -88,29 +105,37 @@ namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
                     ScopeParameter);
             }
 
-            return Expression.Lambda<Func<ServiceProviderEngineScope, object>>(
-                Convert(VisitCallSite(callSite, null), typeof(object), forceValueTypeConversion: true),
+            return Expression.Lambda<Func<ServiceProviderEngineScope, ValueTask<object?>>>(
+                VisitCallSite(callSite, null),
                 ScopeParameter);
+        }
+
+        private static NewExpression WrapInValueTask(Expression objectExpression)
+        {
+            return Expression.New(ValueTaskObjectCtor,
+                Convert(objectExpression, typeof(object), forceValueTypeConversion: true));
         }
 
         protected override Expression VisitRootCache(ServiceCallSite singletonCallSite, object? context)
         {
-            return Expression.Constant(CallSiteRuntimeResolver.Instance.Resolve(singletonCallSite, _rootScope));
+            return WrapInValueTask(
+                Expression.Constant(CallSiteRuntimeResolver.Instance.Resolve(singletonCallSite, _rootScope)));
         }
 
         protected override Expression VisitConstant(ConstantCallSite constantCallSite, object? context)
         {
-            return Expression.Constant(constantCallSite.DefaultValue);
+            return WrapInValueTask(Expression.Constant(constantCallSite.DefaultValue));
         }
 
         protected override Expression VisitServiceProvider(ServiceProviderCallSite serviceProviderCallSite, object? context)
         {
-            return ScopeParameter;
+            return WrapInValueTask(ScopeParameter);
         }
 
         protected override Expression VisitFactory(FactoryCallSite factoryCallSite, object? context)
         {
-            return Expression.Invoke(Expression.Constant(factoryCallSite.Factory), ScopeParameter);
+            return WrapInValueTask(
+                Expression.Invoke(Expression.Constant(factoryCallSite.Factory), ScopeParameter));
         }
 
         protected override Expression VisitIEnumerable(IEnumerableCallSite callSite, object? context)
@@ -135,61 +160,135 @@ namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
 
             if (callSite.ServiceCallSites.Length == 0)
             {
-                return Expression.Constant(
-                    GetArrayEmptyMethodInfo(callSite.ItemType)
-                    .Invoke(obj: null, parameters: Array.Empty<object>()));
+                return WrapInValueTask(
+                    Expression.Constant(
+                        GetArrayEmptyMethodInfo(callSite.ItemType)
+                        .Invoke(obj: null, parameters: Array.Empty<object>())));
             }
 
-            return NewArrayInit(
-                callSite.ItemType,
-                callSite.ServiceCallSites.Select(cs =>
-                    Convert(
-                        VisitCallSite(cs, context),
-                        callSite.ItemType)));
+            int count = callSite.ServiceCallSites.Length;
+
+            ParameterExpression[] vtVars = new ParameterExpression[count];
+            Expression[] body = new Expression[count + 1];
+
+            for (int i = 0; i < count; i++)
+            {
+                vtVars[i] = Expression.Variable(typeof(ValueTask<object?>), $"elemVt{i}");
+                body[i] = Expression.Assign(vtVars[i], VisitCallSite(callSite.ServiceCallSites[i], context));
+            }
+
+            Expression allCompleted = Expression.Property(vtVars[0], ValueTaskIsCompletedSuccessfullyProp);
+            for (int i = 1; i < count; i++)
+            {
+                allCompleted = Expression.AndAlso(allCompleted,
+                    Expression.Property(vtVars[i], ValueTaskIsCompletedSuccessfullyProp));
+            }
+
+            Expression fastPath = WrapInValueTask(
+                NewArrayInit(
+                    callSite.ItemType,
+                    vtVars.Select(vt => Convert(
+                        Expression.Property(vt, ValueTaskResultProp),
+                        callSite.ItemType))));
+
+            Expression slowPath = Expression.Call(
+                AwaitArrayElementsMethod,
+                Expression.Constant(callSite.ItemType),
+                NewValueTaskArray(vtVars));
+
+            body[count] = Expression.Condition(allCompleted, fastPath, slowPath);
+
+            return Expression.Block(typeof(ValueTask<object?>), vtVars, body);
         }
 
         protected override Expression VisitDisposeCache(ServiceCallSite callSite, object? context)
         {
-            // Elide calls to GetCaptureDisposable if the implementation type isn't disposable
-            return TryCaptureDisposable(
-                callSite,
-                ScopeParameter,
-                VisitCallSiteMain(callSite, context));
-        }
+            Expression inner = VisitCallSiteMain(callSite, context);
 
-        private static Expression TryCaptureDisposable(ServiceCallSite callSite, ParameterExpression scope, Expression service)
-        {
             if (!callSite.CaptureDisposable)
             {
-                return service;
+                return inner;
             }
 
-            return Expression.Invoke(GetCaptureDisposable(scope), service);
+            ParameterExpression vtVar = Expression.Variable(typeof(ValueTask<object?>), "disposeVt");
+
+            Expression fastPath = WrapInValueTask(
+                Expression.Call(
+                    ScopeParameter,
+                    ServiceLookupHelpers.CaptureDisposableMethodInfo,
+                    Expression.Property(vtVar, ValueTaskResultProp)));
+
+            Expression slowPath = Expression.Call(
+                AwaitAndCaptureDisposableMethod,
+                vtVar,
+                ScopeParameter);
+
+            return Expression.Block(
+                typeof(ValueTask<object?>),
+                new[] { vtVar },
+                Expression.Assign(vtVar, inner),
+                Expression.Condition(
+                    Expression.Property(vtVar, ValueTaskIsCompletedSuccessfullyProp),
+                    fastPath,
+                    slowPath));
         }
 
         protected override Expression VisitConstructor(ConstructorCallSite callSite, object? context)
         {
             ParameterInfo[] parameters = callSite.ConstructorInfo.GetParameters();
-            Expression[] parameterExpressions;
+
             if (callSite.ParameterCallSites.Length == 0)
             {
-                parameterExpressions = Array.Empty<Expression>();
-            }
-            else
-            {
-                parameterExpressions = new Expression[callSite.ParameterCallSites.Length];
-                for (int i = 0; i < parameterExpressions.Length; i++)
+                Expression newExpr = Expression.New(callSite.ConstructorInfo);
+                if (callSite.ImplementationType!.IsValueType)
                 {
-                    parameterExpressions[i] = Convert(VisitCallSite(callSite.ParameterCallSites[i], context), parameters[i].ParameterType);
+                    newExpr = Expression.Convert(newExpr, typeof(object));
                 }
+
+                return WrapInValueTask(newExpr);
             }
 
-            Expression expression = Expression.New(callSite.ConstructorInfo, parameterExpressions);
+            int count = callSite.ParameterCallSites.Length;
+            ParameterExpression[] vtVars = new ParameterExpression[count];
+            Expression[] body = new Expression[count + 1];
+
+            for (int i = 0; i < count; i++)
+            {
+                vtVars[i] = Expression.Variable(typeof(ValueTask<object?>), $"paramVt{i}");
+                body[i] = Expression.Assign(vtVars[i], VisitCallSite(callSite.ParameterCallSites[i], context));
+            }
+
+            Expression allCompleted = Expression.Property(vtVars[0], ValueTaskIsCompletedSuccessfullyProp);
+            for (int i = 1; i < count; i++)
+            {
+                allCompleted = Expression.AndAlso(allCompleted,
+                    Expression.Property(vtVars[i], ValueTaskIsCompletedSuccessfullyProp));
+            }
+
+            Expression[] fastArgs = new Expression[count];
+            for (int i = 0; i < count; i++)
+            {
+                fastArgs[i] = Convert(
+                    Expression.Property(vtVars[i], ValueTaskResultProp),
+                    parameters[i].ParameterType);
+            }
+
+            Expression construct = Expression.New(callSite.ConstructorInfo, fastArgs);
             if (callSite.ImplementationType!.IsValueType)
             {
-                expression = Expression.Convert(expression, typeof(object));
+                construct = Expression.Convert(construct, typeof(object));
             }
-            return expression;
+
+            Expression fastPath = WrapInValueTask(construct);
+
+            Expression slowPath = Expression.Call(
+                AwaitConstructorMethod,
+                Expression.Constant(callSite.ConstructorInfo),
+                NewValueTaskArray(vtVars));
+
+            body[count] = Expression.Condition(allCompleted, fastPath, slowPath);
+
+            return Expression.Block(typeof(ValueTask<object?>), vtVars, body);
         }
 
         private static Expression Convert(Expression expression, Type type, bool forceValueTypeConversion = false)
@@ -204,9 +303,16 @@ namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
             return Expression.Convert(expression, type);
         }
 
+        [UnconditionalSuppressMessage("AotAnalysis", "IL3050:RequiresDynamicCode",
+            Justification = "ValueTask<object?> is a well-known BCL type; array creation is always safe")]
+        private static NewArrayExpression NewValueTaskArray(ParameterExpression[] variables)
+        {
+            return Expression.NewArrayInit(typeof(ValueTask<object?>), variables);
+        }
+
         protected override Expression VisitScopeCache(ServiceCallSite callSite, object? context)
         {
-            Func<ServiceProviderEngineScope, object> lambda = Build(callSite);
+            Func<ServiceProviderEngineScope, ValueTask<object?>> lambda = Build(callSite);
             return Expression.Invoke(Expression.Constant(lambda), ScopeParameter);
         }
 
@@ -217,12 +323,10 @@ namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
                 callSite,
                 typeof(ServiceCallSite));
 
-            // We want to directly use the callsite value if it's set and the scope is the root scope.
-            // We've already called into the RuntimeResolver and pre-computed any singletons or root scope
-            // Avoid the compilation for singletons (or promoted singletons)
+            // For root scope, delegate to RuntimeResolver.ResolveAsync which returns ValueTask<object?> directly.
             MethodCallExpression resolveRootScopeExpression = Expression.Call(
                 CallSiteRuntimeResolverInstanceExpression,
-                ServiceLookupHelpers.ResolveCallSiteAndScopeMethodInfo,
+                ServiceLookupHelpers.ResolveAsyncCallSiteAndScopeMethodInfo,
                 callSiteExpression,
                 ScopeParameter);
 
@@ -240,11 +344,20 @@ namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
                 keyExpression,
                 resolvedVariable);
 
-            Expression captureDisposible = TryCaptureDisposable(callSite, ScopeParameter, VisitCallSiteMain(callSite, null));
+            // VisitCallSiteMain returns ValueTask<object?>; unwrap synchronously under the lock.
+            Expression serviceVtExpression = VisitCallSiteMain(callSite, null);
+            Expression unwrappedService = Expression.Call(GetSynchronousResultObjectMethod, serviceVtExpression);
 
-            BinaryExpression assignExpression = Expression.Assign(
-                resolvedVariable,
-                captureDisposible);
+            Expression assignExpression;
+            if (callSite.CaptureDisposable)
+            {
+                assignExpression = Expression.Assign(resolvedVariable,
+                    Expression.Call(ScopeParameter, ServiceLookupHelpers.CaptureDisposableMethodInfo, unwrappedService));
+            }
+            else
+            {
+                assignExpression = Expression.Assign(resolvedVariable, unwrappedService);
+            }
 
             MethodCallExpression addValueExpression = Expression.Call(
                 resolvedServices,
@@ -252,8 +365,10 @@ namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
                 keyExpression,
                 resolvedVariable);
 
+            Expression wrappedResult = WrapInValueTask(resolvedVariable);
+
             BlockExpression blockExpression = Expression.Block(
-                typeof(object),
+                typeof(ValueTask<object?>),
                 new[]
                 {
                     resolvedVariable
@@ -263,7 +378,7 @@ namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
                     Expression.Block(
                         assignExpression,
                         addValueExpression)),
-                resolvedVariable);
+                wrappedResult);
 
 
             // The C# compiler would copy the lock object to guard against mutation.
@@ -284,19 +399,10 @@ namespace Microsoft.Extensions.DependencyInjection.ServiceLookup
                             .GetProperty(nameof(ServiceProviderEngineScope.IsRootScope), BindingFlags.Instance | BindingFlags.Public)!),
                     resolveRootScopeExpression,
                     Expression.Block(
-                        typeof(object),
+                        typeof(ValueTask<object?>),
                         new[] { lockWasTaken },
                         Expression.TryFinally(tryBody, finallyBody))
                 );
-        }
-
-        public static Expression GetCaptureDisposable(ParameterExpression scope)
-        {
-            if (scope != ScopeParameter)
-            {
-                throw new NotSupportedException(SR.GetCaptureDisposableNotSupported);
-            }
-            return CaptureDisposable;
         }
     }
 }
