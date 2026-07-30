@@ -6,6 +6,7 @@ include(${CLR_ENG_NATIVE_DIR}/configurecompiler.cmake)
 
 set(COREHOST_ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
 
+option(CLR_CMAKE_ALLOW_RENAMED_DOTNET "Allow the dotnet executable to run when renamed" OFF)
 option(CLR_CMAKE_BUILD_HOST_PRODUCT "Build host product components" ON)
 option(CLR_CMAKE_BUILD_HOST_TESTS "Build host test components" OFF)
 

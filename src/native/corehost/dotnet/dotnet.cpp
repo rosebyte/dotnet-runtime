@@ -23,6 +23,8 @@ int exe_start(const int argc, const pal::char_t* argv[])
 
     pal::string_t app_path;
     pal::string_t app_root;
+
+#if !defined(ALLOW_RENAMED_DOTNET)
     pal::string_t own_name = strip_executable_ext(get_filename(host_path));
 
     if (pal::strcasecmp(own_name.c_str(), _X("dotnet")) != 0)
@@ -34,6 +36,7 @@ int exe_start(const int argc, const pal::char_t* argv[])
         trace::error(_X("Error: cannot execute %s when renamed to %s."), _X("dotnet"), own_name.c_str());
         return StatusCode::CoreHostEntryPointFailure;
     }
+#endif
 
     if (argc <= 1)
     {
@@ -54,8 +57,12 @@ int exe_start(const int argc, const pal::char_t* argv[])
 
     app_root.assign(host_path);
     app_path.assign(get_directory(app_root));
+#if defined(ALLOW_RENAMED_DOTNET)
+    append_path(&app_path, SDK_DOTNET_DLL);
+#else
     append_path(&app_path, own_name.c_str());
     app_path.append(_X(".dll"));
+#endif
 
     hostfxr_resolver_t fxr{app_root};
 

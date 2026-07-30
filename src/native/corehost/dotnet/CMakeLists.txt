@@ -22,6 +22,10 @@ list(APPEND SOURCES
 
 add_executable(dotnet ${SOURCES})
 
+if(CLR_CMAKE_ALLOW_RENAMED_DOTNET)
+    target_compile_definitions(dotnet PRIVATE ALLOW_RENAMED_DOTNET)
+endif()
+
 target_link_libraries(dotnet PRIVATE hostmisc fxr_resolver)
 
 add_sanitizer_runtime_support(dotnet)
