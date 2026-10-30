@@ -15,6 +15,468 @@ namespace Microsoft.Extensions.Configuration.Test
 {
     public class ConfigurationManagerTest
     {
+        [Theory]
+        [InlineData(ConfigurationFailureStage.Load)]
+        [InlineData(ConfigurationFailureStage.GetReloadToken)]
+        [InlineData(ConfigurationFailureStage.RegisterChangeCallback)]
+        public void FailedOwnedAdditionDisposesCandidateAndAllowsFreshRetry(ConfigurationFailureStage stage)
+        {
+            using var config = new ConfigurationManager();
+            Exception failure = null;
+            var source = new OwnedConfigurationFailureSource
+            {
+                Configure = p => failure = new ConfigurationFailureSource(p).SetFailure(stage)
+            };
+
+            Exception exception = Assert.Throws<InvalidOperationException>(() => config.Sources.Add(source));
+            Assert.Same(failure, exception);
+            ConfigurationFailureProvider rejected = source.Provider;
+            Assert.Equal(1, rejected.DisposeCount);
+            Assert.Equal(0, rejected.Token.RegistrationCount);
+            Assert.DoesNotContain(source, config.Sources);
+
+            source.Configure = null;
+            config.Sources.Add(source);
+            Assert.NotSame(rejected, source.Provider);
+            Assert.Equal(0, source.Provider.DisposeCount);
+            Assert.Equal(1, source.Provider.Token.RegistrationCount);
+        }
+
+        [Theory]
+        [InlineData(ConfigurationFailureStage.Build)]
+        [InlineData(ConfigurationFailureStage.Load)]
+        [InlineData(ConfigurationFailureStage.GetReloadToken)]
+        [InlineData(ConfigurationFailureStage.RegisterChangeCallback)]
+        public void FailedOwnedRebuildDisposesOnlyReplacementCandidates(ConfigurationFailureStage stage)
+        {
+            using var config = new ConfigurationManager();
+            var owned = new OwnedConfigurationFailureSource();
+            using var borrowedProvider = new ConfigurationFailureProvider();
+            var failingSource = new ConfigurationFailureSource(borrowedProvider);
+            config.Sources.Add(owned);
+            config.Sources.Add(failingSource);
+            ConfigurationFailureProvider active = owned.Provider;
+            Exception failure = failingSource.SetFailure(stage);
+
+            Assert.Same(failure, Assert.Throws<InvalidOperationException>(() =>
+                ((IConfigurationBuilder)config).Properties["changed"] = true));
+            ConfigurationFailureProvider rejected = owned.Provider;
+            Assert.NotSame(active, rejected);
+            Assert.Equal(1, rejected.DisposeCount);
+            Assert.Equal(0, rejected.Token.RegistrationCount);
+            Assert.Equal(0, active.DisposeCount);
+            Assert.Equal(1, active.Token.RegistrationCount);
+            Assert.Equal(0, borrowedProvider.DisposeCount);
+
+            failingSource.ClearFailure();
+            ((IConfigurationBuilder)config).Properties["retry"] = true;
+            Assert.NotSame(rejected, owned.Provider);
+            Assert.Equal(0, owned.Provider.DisposeCount);
+            Assert.Equal(1, active.DisposeCount);
+        }
+
+        [Theory]
+        [InlineData(false)]
+        [InlineData(true)]
+        public void NotificationFailureDoesNotDisposeOwnedCandidate(bool replaceProviders)
+        {
+            using var config = new ConfigurationManager();
+            var source = new OwnedConfigurationFailureSource();
+            var failure = new InvalidOperationException("Notification failed.");
+            using IDisposable registration = ((IConfiguration)config).GetReloadToken()
+                .RegisterChangeCallback(_ => throw failure, null);
+
+            AggregateException exception = Assert.Throws<AggregateException>(() =>
+            {
+                if (replaceProviders)
+                {
+                    config.Sources.Insert(0, source);
+                }
+                else
+                {
+                    config.Sources.Add(source);
+                }
+            });
+
+            Assert.Same(failure, Assert.Single(exception.InnerExceptions));
+            Assert.Contains(source.Provider, ((IConfigurationRoot)config).Providers);
+            Assert.Equal(0, source.Provider.DisposeCount);
+        }
+
+        [Fact]
+        public void RetirementFailureDoesNotDisposeOwnedReplacement()
+        {
+            using var config = new ConfigurationManager();
+            var source = new OwnedConfigurationFailureSource();
+            config.Sources.Add(source);
+            ConfigurationFailureProvider previous = source.Provider;
+            var failure = new InvalidOperationException("Provider disposal failed.");
+            previous.DisposeException = failure;
+
+            Assert.Same(failure, Assert.Throws<InvalidOperationException>(() =>
+                ((IConfigurationBuilder)config).Properties["changed"] = true));
+            Assert.NotSame(previous, source.Provider);
+            Assert.Equal(1, previous.DisposeCount);
+            Assert.Equal(0, source.Provider.DisposeCount);
+            Assert.Contains(source.Provider, ((IConfigurationRoot)config).Providers);
+        }
+
+        [Theory]
+        [InlineData(ConfigurationFailureStage.Build)]
+        [InlineData(ConfigurationFailureStage.Load)]
+        [InlineData(ConfigurationFailureStage.GetReloadToken)]
+        [InlineData(ConfigurationFailureStage.RegisterChangeCallback)]
+        public void FailedAdditionRemovesSourceAndAllowsRetry(ConfigurationFailureStage stage)
+        {
+            using var provider = new ConfigurationFailureProvider();
+            var source = new ConfigurationFailureSource(provider);
+            using var config = new ConfigurationManager();
+            IConfigurationBuilder builder = config;
+            IConfigurationSource[] originalSources = config.Sources.ToArray();
+            IChangeToken token = ((IConfiguration)config).GetReloadToken();
+            Exception failure = source.SetFailure(stage);
+
+            Assert.Same(failure, Assert.Throws<InvalidOperationException>(() => builder.Add(source)));
+            Assert.Equal(originalSources, config.Sources);
+            Assert.Equal(0, provider.DisposeCount);
+            Assert.Equal(0, provider.Token.RegistrationCount);
+            Assert.False(token.HasChanged);
+
+            builder.Properties["retry"] = true;
+            Assert.Equal(1, source.BuildCount);
+
+            source.ClearFailure();
+            builder.Add(source);
+            Assert.Equal(2, source.BuildCount);
+            Assert.Equal(1, provider.Token.RegistrationCount);
+            Assert.Same(source, config.Sources.Last());
+            Assert.Equal("value", config["key"]);
+        }
+
+        [Theory]
+        [InlineData(false)]
+        [InlineData(true)]
+        public void FailedAdditionToDisposedManagerReleasesRegistration(bool cleanupThrows)
+        {
+            using var provider = new ConfigurationFailureProvider();
+            var source = new ConfigurationFailureSource(provider);
+            var config = new ConfigurationManager();
+            config.Dispose();
+            IConfigurationSource[] originalSources = config.Sources.ToArray();
+            var cleanupFailure = new InvalidOperationException("Registration disposal failed.");
+            if (cleanupThrows)
+            {
+                provider.Token.DisposeException = cleanupFailure;
+            }
+
+            if (cleanupThrows)
+            {
+                AggregateException exception = Assert.Throws<AggregateException>(() => config.Sources.Add(source));
+                Assert.Equal(2, exception.InnerExceptions.Count);
+                Assert.IsType<ObjectDisposedException>(exception.InnerExceptions[0]);
+                Assert.Same(cleanupFailure, exception.InnerExceptions[1]);
+            }
+            else
+            {
+                Assert.Throws<ObjectDisposedException>(() => config.Sources.Add(source));
+            }
+
+            Assert.Equal(originalSources, config.Sources);
+            Assert.Equal(0, provider.Token.RegistrationCount);
+            Assert.Equal(0, provider.DisposeCount);
+        }
+
+        [Theory]
+        [InlineData(nameof(IList<IConfigurationSource>.Add))]
+        [InlineData(nameof(IList<IConfigurationSource>.Clear))]
+        [InlineData(nameof(IList<IConfigurationSource>.Insert))]
+        [InlineData(nameof(IConfigurationBuilder.Properties))]
+        public void FailedAdditionDoesNotUndoReentrantChanges(string mutation)
+        {
+            using var provider = new ConfigurationFailureProvider();
+            var source = new ConfigurationFailureSource(provider);
+            using var config = new ConfigurationManager();
+            var failure = new InvalidOperationException("Source construction failed after changing the builder.");
+            IConfigurationSource[] expectedSources = null;
+            IConfigurationProvider[] expectedProviders = null;
+            source.BeforeBuild = builder =>
+            {
+                source.BeforeBuild = null;
+                switch (mutation)
+                {
+                    case nameof(IList<IConfigurationSource>.Add):
+                        builder.Sources.Add(new MemoryConfigurationSource());
+                        break;
+                    case nameof(IList<IConfigurationSource>.Clear):
+                        builder.Sources.Clear();
+                        break;
+                    case nameof(IList<IConfigurationSource>.Insert):
+                        builder.Sources.Insert(0, new MemoryConfigurationSource());
+                        break;
+                    case nameof(IConfigurationBuilder.Properties):
+                        builder.Properties["changed"] = true;
+                        break;
+                }
+
+                expectedSources = builder.Sources
+                    .Where(s => mutation != nameof(IList<IConfigurationSource>.Add) || !ReferenceEquals(s, source))
+                    .ToArray();
+                expectedProviders = ((IConfigurationRoot)builder).Providers.ToArray();
+                source.BuildException = failure;
+                throw failure;
+            };
+
+            Assert.Same(failure, Assert.Throws<InvalidOperationException>(() => config.Sources.Add(source)));
+            Assert.Equal(expectedSources, config.Sources);
+            Assert.Equal(expectedProviders, ((IConfigurationRoot)config).Providers);
+            Assert.Equal(0, provider.DisposeCount);
+            if (mutation == nameof(IList<IConfigurationSource>.Add))
+            {
+                ((IConfigurationBuilder)config).Properties["retry"] = true;
+                Assert.Equal(1, source.BuildCount);
+            }
+        }
+
+        [Theory]
+        [InlineData(false)]
+        [InlineData(true)]
+        public void FailedAdditionPreservesCachedProvider(bool sameManager)
+        {
+            using var provider = new ConfigurationFailureProvider();
+            var source = new ConfigurationFailureSource(provider);
+            using var owner = new ConfigurationManager();
+            using var other = new ConfigurationManager();
+            owner.Sources.Add(source);
+            ConfigurationManager target = sameManager ? owner : other;
+            IConfigurationSource[] originalSources = target.Sources.ToArray();
+            Exception failure = source.SetFailure(ConfigurationFailureStage.Load);
+
+            Assert.Same(failure, Assert.Throws<InvalidOperationException>(() => target.Sources.Add(source)));
+            Assert.Equal(originalSources, target.Sources);
+            Assert.Equal(0, provider.DisposeCount);
+            Assert.Equal(1, provider.Token.RegistrationCount);
+            Assert.Equal("value", owner["key"]);
+            source.ClearFailure();
+            IChangeToken token = ((IConfiguration)owner).GetReloadToken();
+            provider.Reload();
+            Assert.True(token.HasChanged);
+        }
+
+        [Theory]
+        [InlineData(false, ConfigurationFailureStage.Build)]
+        [InlineData(false, ConfigurationFailureStage.Load)]
+        [InlineData(false, ConfigurationFailureStage.GetReloadToken)]
+        [InlineData(false, ConfigurationFailureStage.RegisterChangeCallback)]
+        [InlineData(true, ConfigurationFailureStage.Build)]
+        [InlineData(true, ConfigurationFailureStage.Load)]
+        [InlineData(true, ConfigurationFailureStage.GetReloadToken)]
+        [InlineData(true, ConfigurationFailureStage.RegisterChangeCallback)]
+        public void FailedSourceReloadPreservesActiveConfiguration(bool changeProperty, ConfigurationFailureStage stage)
+        {
+            using var active = new ConfigurationFailureProvider();
+            using var candidate = new ConfigurationFailureProvider();
+            using var failing = new ConfigurationFailureProvider();
+            var source = new ConfigurationFailureSource(active);
+            var failingSource = new ConfigurationFailureSource(failing);
+            using var config = new ConfigurationManager();
+            IConfigurationBuilder builder = config;
+            config.Sources.Add(source);
+            config.Sources.Add(failingSource);
+            source.Provider = candidate;
+            Exception failure = failingSource.SetFailure(stage);
+            IConfigurationProvider[] originalProviders = ((IConfigurationRoot)config).Providers.ToArray();
+            IChangeToken token = ((IConfiguration)config).GetReloadToken();
+
+            Assert.Same(failure, Assert.Throws<InvalidOperationException>(() =>
+            {
+                if (changeProperty)
+                {
+                    builder.Properties["changed"] = true;
+                }
+                else
+                {
+                    config.Sources.Insert(0, new MemoryConfigurationSource());
+                }
+            }));
+
+            Assert.Equal(originalProviders, ((IConfigurationRoot)config).Providers);
+            Assert.Equal(0, active.DisposeCount);
+            Assert.Equal(0, candidate.DisposeCount);
+            Assert.Equal(0, failing.DisposeCount);
+            Assert.Equal(1, active.Token.RegistrationCount);
+            Assert.Equal(1, failing.Token.RegistrationCount);
+            Assert.Equal(0, candidate.Token.RegistrationCount);
+            Assert.False(token.HasChanged);
+            Assert.Equal("value", config["key"]);
+            if (changeProperty)
+            {
+                Assert.Equal(true, builder.Properties["changed"]);
+            }
+            else
+            {
+                Assert.Equal(4, config.Sources.Count);
+            }
+
+            active.Reload();
+            Assert.True(token.HasChanged);
+
+            failingSource.ClearFailure();
+            builder.Properties["retry"] = true;
+            Assert.Contains(candidate, ((IConfigurationRoot)config).Providers);
+            Assert.Equal(1, candidate.Token.RegistrationCount);
+            Assert.Equal(0, active.Token.RegistrationCount);
+            Assert.Equal(1, failing.Token.RegistrationCount);
+            Assert.Equal(1, active.DisposeCount);
+        }
+
+        [Theory]
+        [InlineData(false)]
+        [InlineData(true)]
+        public void NotificationFailureDoesNotUndoPublishedChanges(bool replaceProviders)
+        {
+            using var provider = new ConfigurationFailureProvider();
+            var source = new ConfigurationFailureSource(provider);
+            using var config = new ConfigurationManager();
+            var failure = new InvalidOperationException("Notification failed.");
+            using IDisposable registration = ((IConfiguration)config).GetReloadToken()
+                .RegisterChangeCallback(_ => throw failure, null);
+
+            AggregateException exception = Assert.Throws<AggregateException>(() =>
+            {
+                if (replaceProviders)
+                {
+                    config.Sources.Insert(0, source);
+                }
+                else
+                {
+                    config.Sources.Add(source);
+                }
+            });
+
+            Assert.Same(failure, Assert.Single(exception.InnerExceptions));
+            Assert.Contains(source, config.Sources);
+            Assert.Contains(provider, ((IConfigurationRoot)config).Providers);
+            Assert.Equal(0, provider.DisposeCount);
+            Assert.Equal(1, provider.Token.RegistrationCount);
+            Assert.Equal("value", config["key"]);
+        }
+
+        [Theory]
+        [InlineData(false, false)]
+        [InlineData(false, true)]
+        [InlineData(true, false)]
+        [InlineData(true, true)]
+        public void DisposalFailureDoesNotUndoPublishedChanges(bool registrationThrows, bool notificationThrows)
+        {
+            var oldProvider = new ConfigurationFailureProvider();
+            using var newProvider = new ConfigurationFailureProvider();
+            var source = new ConfigurationFailureSource(oldProvider);
+            using var config = new ConfigurationManager();
+            config.Sources.Add(source);
+            source.Provider = newProvider;
+            var failure = new InvalidOperationException("Disposal failed.");
+            var notificationFailure = new InvalidOperationException("Notification failed.");
+            IChangeToken token = ((IConfiguration)config).GetReloadToken();
+            using IDisposable registration = token.RegisterChangeCallback(_ =>
+            {
+                if (notificationThrows)
+                {
+                    throw notificationFailure;
+                }
+            }, null);
+            if (registrationThrows)
+            {
+                oldProvider.Token.DisposeException = failure;
+            }
+            else
+            {
+                oldProvider.DisposeException = failure;
+            }
+
+            if (notificationThrows)
+            {
+                AggregateException exception = Assert.Throws<AggregateException>(() =>
+                    ((IConfigurationBuilder)config).Properties["changed"] = true);
+                Assert.Equal(new[] { failure, notificationFailure }, exception.Flatten().InnerExceptions);
+            }
+            else
+            {
+                Assert.Same(failure, Assert.Throws<InvalidOperationException>(() =>
+                    ((IConfigurationBuilder)config).Properties["changed"] = true));
+            }
+
+            Assert.True(token.HasChanged);
+            Assert.Contains(newProvider, ((IConfigurationRoot)config).Providers);
+            Assert.DoesNotContain(oldProvider, ((IConfigurationRoot)config).Providers);
+            Assert.Equal(true, ((IConfigurationBuilder)config).Properties["changed"]);
+            Assert.Equal(0, oldProvider.Token.RegistrationCount);
+            Assert.Equal(1, oldProvider.DisposeCount);
+            Assert.Equal(0, newProvider.DisposeCount);
+            Assert.Equal(1, newProvider.Token.RegistrationCount);
+            Assert.Equal("value", config["key"]);
+        }
+
+        [Fact]
+        public void RetirementReportsMultipleFailuresAndNotifiesSubscribers()
+        {
+            var first = new ConfigurationFailureProvider();
+            var second = new ConfigurationFailureProvider();
+            using var config = new ConfigurationManager();
+            config.Sources.Add(new ConfigurationFailureSource(first));
+            config.Sources.Add(new ConfigurationFailureSource(second));
+            var registrationFailure = new InvalidOperationException("Registration disposal failed.");
+            var providerFailure = new InvalidOperationException("Provider disposal failed.");
+            first.Token.DisposeException = registrationFailure;
+            second.DisposeException = providerFailure;
+            IChangeToken token = ((IConfiguration)config).GetReloadToken();
+
+            AggregateException exception = Assert.Throws<AggregateException>(() => config.Sources.Clear());
+
+            Assert.Equal(new[] { registrationFailure, providerFailure }, exception.InnerExceptions);
+            Assert.True(token.HasChanged);
+            Assert.Empty(config.Sources);
+            Assert.Empty(((IConfigurationRoot)config).Providers);
+            Assert.Equal(0, first.Token.RegistrationCount);
+            Assert.Equal(0, second.Token.RegistrationCount);
+            Assert.Equal(1, first.DisposeCount);
+            Assert.Equal(1, second.DisposeCount);
+        }
+
+        [Theory]
+        [InlineData(false, false)]
+        [InlineData(false, true)]
+        [InlineData(true, false)]
+        [InlineData(true, true)]
+        public void FailedReloadPreservesProvidersAndAllowsRecovery(bool useManager, bool fromWatcher)
+        {
+            using var provider = new ConfigurationFailureProvider();
+            var source = new ConfigurationFailureSource(provider);
+            IConfigurationBuilder builder = useManager ? new ConfigurationManager() : new ConfigurationBuilder();
+            builder.Add(source);
+            IConfigurationRoot root = builder.Build();
+            using var owner = (IDisposable)root;
+            Exception failure = source.SetFailure(ConfigurationFailureStage.Load);
+
+            if (fromWatcher)
+            {
+                using IDisposable registration = root.GetReloadToken().RegisterChangeCallback(_ => root.Reload(), null);
+                AggregateException exception = Assert.Throws<AggregateException>(() => provider.Reload());
+                Assert.Contains(failure, exception.Flatten().InnerExceptions);
+            }
+            else
+            {
+                Assert.Same(failure, Assert.Throws<InvalidOperationException>(() => root.Reload()));
+            }
+
+            Assert.Equal(0, provider.DisposeCount);
+            Assert.Equal(1, provider.Token.RegistrationCount);
+            source.ClearFailure();
+            root.Reload();
+            IChangeToken token = root.GetReloadToken();
+            provider.Reload();
+            Assert.True(token.HasChanged);
+        }
+
         [Fact]
         public void AutoUpdates()
         {

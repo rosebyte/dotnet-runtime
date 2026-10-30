@@ -4,6 +4,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Runtime.ExceptionServices;
 using System.Threading;
 using Microsoft.Extensions.Primitives;
 
@@ -30,10 +31,18 @@ namespace Microsoft.Extensions.Configuration
 
             _providers = providers;
             _changeTokenRegistrations = new List<IDisposable>(providers.Count);
-            foreach (IConfigurationProvider p in providers)
+            try
             {
-                p.Load();
-                _changeTokenRegistrations.Add(ChangeToken.OnChange(p.GetReloadToken, RaiseChanged));
+                foreach (IConfigurationProvider p in providers)
+                {
+                    p.Load();
+                    _changeTokenRegistrations.Add(ChangeToken.OnChange(p.GetReloadToken, RaiseChanged));
+                }
+            }
+            catch (Exception exception)
+            {
+                DisposeResources(_changeTokenRegistrations, exception);
+                throw;
             }
         }
 
@@ -108,6 +117,85 @@ namespace Microsoft.Extensions.Configuration
             foreach (IConfigurationProvider provider in _providers)
             {
                 (provider as IDisposable)?.Dispose();
+            }
+        }
+
+        internal static IDisposable? GetOwnedProvider(
+            IConfigurationSource source, IConfigurationProvider provider, List<IConfigurationProvider>? activeProviders = null)
+        {
+            if (source is IConfigurationSourceWithOwnedProviders { OwnsProviders: true } && provider is IDisposable disposable)
+            {
+                if (activeProviders is not null)
+                {
+                    foreach (IConfigurationProvider activeProvider in activeProviders)
+                    {
+                        if (ReferenceEquals(provider, activeProvider))
+                        {
+                            return null;
+                        }
+                    }
+                }
+
+                return disposable;
+            }
+
+            return null;
+        }
+
+        internal static void AddOwnedProviders(
+            List<IDisposable> resources,
+            IList<IConfigurationSource> sources,
+            List<IConfigurationProvider> providers,
+            List<IConfigurationSource>.Enumerator sourceEnumerator,
+            List<IConfigurationProvider>? activeProviders = null)
+        {
+            try
+            {
+                // Validate the original enumeration before pairing providers with sources on this failure path.
+                sourceEnumerator.MoveNext();
+            }
+            catch (InvalidOperationException)
+            {
+                // Reentrant edits make the source/provider pairing ambiguous.
+                return;
+            }
+
+            for (int i = 0; i < providers.Count; i++)
+            {
+                if (GetOwnedProvider(sources[i], providers[i], activeProviders) is IDisposable provider)
+                {
+                    resources.Add(provider);
+                }
+            }
+        }
+
+        internal static void DisposeResources(List<IDisposable> resources, Exception? exception = null)
+        {
+            List<Exception>? exceptions = null;
+            foreach (IDisposable resource in resources)
+            {
+                try
+                {
+                    resource.Dispose();
+                }
+                catch (Exception disposalException)
+                {
+                    (exceptions ??= new List<Exception>()).Add(disposalException);
+                }
+            }
+
+            if (exceptions is not null)
+            {
+                if (exception is not null)
+                {
+                    exceptions.Insert(0, exception);
+                }
+                else if (exceptions.Count == 1)
+                {
+                    ExceptionDispatchInfo.Capture(exceptions[0]).Throw();
+                }
+
+                throw new AggregateException(exceptions);
             }
         }
 

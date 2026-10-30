@@ -15,12 +15,14 @@ namespace Microsoft.Extensions.Configuration
         private ReferenceCountedProviders _refCountedProviders = ReferenceCountedProviders.Create(new List<IConfigurationProvider>());
         private bool _disposed;
 
-        // This is only used to support IConfigurationRoot.Providers because we cannot track the lifetime of that reference.
-        public IEnumerable<IConfigurationProvider> NonReferenceCountedProviders => _refCountedProviders.NonReferenceCountedProviders;
+        // Uncounted access for IConfigurationRoot.Providers and detecting reentrant replacements.
+        // Callers must not modify the returned instance or its reference count.
+        // Replacements change this instance; appending a provider only changes its list.
+        public ReferenceCountedProviders CurrentProviders => _refCountedProviders;
 
         public ReferenceCountedProviders GetReference()
         {
-            // Lock to ensure oldRefCountedProviders.Dispose() in ReplaceProviders() or Dispose() doesn't decrement ref count to zero
+            // Lock to ensure releasing the old providers doesn't decrement ref count to zero
             // before calling _refCountedProviders.AddReference().
             lock (_replaceProvidersLock)
             {
@@ -38,7 +40,7 @@ namespace Microsoft.Extensions.Configuration
         }
 
         // Providers should never be concurrently modified. Reading during modification is allowed.
-        public void ReplaceProviders(List<IConfigurationProvider> providers)
+        public ReferenceCountedProviders ReplaceProviders(List<IConfigurationProvider> providers)
         {
             ReferenceCountedProviders oldRefCountedProviders = _refCountedProviders;
 
@@ -52,10 +54,8 @@ namespace Microsoft.Extensions.Configuration
                 _refCountedProviders = ReferenceCountedProviders.Create(providers);
             }
 
-            // Decrement the reference count to the old providers. If they are being concurrently read from
-            // the actual disposal of the old providers will be delayed until the final reference is released.
-            // Never dispose ReferenceCountedProviders with a lock because this may call into user code.
-            oldRefCountedProviders.Dispose();
+            // The caller releases the old providers after publishing the new registrations.
+            return oldRefCountedProviders;
         }
 
         public void AddProvider(IConfigurationProvider provider)
@@ -67,7 +67,8 @@ namespace Microsoft.Extensions.Configuration
                     throw new ObjectDisposedException(nameof(ConfigurationManager));
                 }
 
-                // Maintain existing references, but replace list with copy containing new item.
+                // Keep the holder for existing readers and for identifying reentrant appends.
+                // Replace its list with a copy containing the new item.
                 _refCountedProviders.Providers = new List<IConfigurationProvider>(_refCountedProviders.Providers)
                 {
                     provider

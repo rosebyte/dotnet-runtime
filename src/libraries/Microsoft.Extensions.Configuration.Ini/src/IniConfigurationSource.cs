@@ -1,6 +1,10 @@
 // Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
+extern alias ConfigurationCore;
+
+global using ConfigurationCore::Microsoft.Extensions.Configuration;
+
 namespace Microsoft.Extensions.Configuration.Ini
 {
     /// <summary>
@@ -15,8 +19,10 @@ namespace Microsoft.Extensions.Configuration.Ini
     /// # comment
     /// / comment
     /// </examples>
-    public class IniConfigurationSource : FileConfigurationSource
+    public class IniConfigurationSource : FileConfigurationSource, IConfigurationSourceWithOwnedProviders
     {
+        bool IConfigurationSourceWithOwnedProviders.OwnsProviders => GetType() == typeof(IniConfigurationSource);
+
         /// <summary>
         /// Builds the <see cref="IniConfigurationProvider"/> for this source.
         /// </summary>

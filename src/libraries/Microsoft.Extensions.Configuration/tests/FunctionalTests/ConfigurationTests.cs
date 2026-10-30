@@ -5,6 +5,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Configuration.Ini;
@@ -577,6 +578,226 @@ IniKey1=IniValue2");
                 Assert.True(callbackCalled);
                 Assert.IsType<IOException>(failureException);
             }
+        }
+
+        [Theory]
+        [MemberData(nameof(FileSourceFailureStages))]
+        public void FailedBuilderDisposesFreshStandardFileProviderCandidates(
+            FileSourceKind sourceKind,
+            TestFailureStage failureStage)
+        {
+            var fileProvider = new TrackingFileProvider();
+            var failureSource = new FaultingConfigurationSource();
+            InvalidOperationException failure = failureSource.FailAt(failureStage);
+            var builder = new ConfigurationBuilder();
+            builder.Add(CreateFileSource(sourceKind, fileProvider, "first"));
+            builder.Add(CreateFileSource(sourceKind, fileProvider, "second"));
+            builder.Add(failureSource);
+            builder.Add(CreateFileSource(sourceKind, fileProvider, "last"));
+
+            Assert.Same(failure, Assert.Throws<InvalidOperationException>(() => builder.Build()));
+            Assert.Equal(failureStage == TestFailureStage.Build ? 2 : 3, fileProvider.WatchCallCount);
+            Assert.Equal(0, fileProvider.LiveCallbackRegistrationCount);
+            Assert.Equal(0, fileProvider.DisposeCount);
+            Assert.All(failureSource.Providers, provider => Assert.Equal(0, provider.DisposeCount));
+        }
+
+        [Theory]
+        [InlineData(FileSourceKind.Json)]
+        [InlineData(FileSourceKind.Ini)]
+        [InlineData(FileSourceKind.Xml)]
+        public void FailedManagerAddDisposesStandardFileProviderCandidateAndAllowsRetry(FileSourceKind sourceKind)
+        {
+            var fileProvider = new TrackingFileProvider();
+            FileConfigurationSource source = CreateFileSource(sourceKind, fileProvider, "missing", optional: false);
+            var manager = new ConfigurationManager();
+
+            Assert.Throws<FileNotFoundException>(() => manager.Sources.Add(source));
+            Assert.DoesNotContain(source, manager.Sources);
+            Assert.Equal(1, fileProvider.WatchCallCount);
+            Assert.Equal(0, fileProvider.LiveCallbackRegistrationCount);
+            Assert.Equal(0, fileProvider.DisposeCount);
+
+            source.Optional = true;
+            manager.Sources.Add(source);
+            Assert.Contains(source, manager.Sources);
+            Assert.Equal(2, fileProvider.WatchCallCount);
+            Assert.Equal(1, fileProvider.LiveCallbackRegistrationCount);
+
+            fileProvider.SetContent(GetFileContent(sourceKind, "working"));
+            ((IConfigurationRoot)manager).Reload();
+            Assert.Equal("working", manager["Key"]);
+
+            manager.Dispose();
+            Assert.Equal(0, fileProvider.LiveCallbackRegistrationCount);
+            Assert.Equal(0, fileProvider.DisposeCount);
+        }
+
+        [Theory]
+        [InlineData(FileSourceKind.Json)]
+        [InlineData(FileSourceKind.Ini)]
+        [InlineData(FileSourceKind.Xml)]
+        public void FailedManagerAddAfterDisposeDisposesStandardFileProviderCandidate(FileSourceKind sourceKind)
+        {
+            var fileProvider = new TrackingFileProvider();
+            FileConfigurationSource source = CreateFileSource(sourceKind, fileProvider, "missing");
+            var manager = new ConfigurationManager();
+            manager.Dispose();
+
+            Assert.Throws<ObjectDisposedException>(() => manager.Sources.Add(source));
+            Assert.DoesNotContain(source, manager.Sources);
+            Assert.Equal(1, fileProvider.WatchCallCount);
+            Assert.Equal(0, fileProvider.LiveCallbackRegistrationCount);
+            Assert.Equal(0, fileProvider.DisposeCount);
+        }
+
+        [Theory]
+        [InlineData(FileSourceKind.Json)]
+        [InlineData(FileSourceKind.Ini)]
+        [InlineData(FileSourceKind.Xml)]
+        public void FailedManagerAddPreservesProviderPublishedReentrantly(FileSourceKind sourceKind)
+        {
+            var fileProvider = new TrackingFileProvider();
+            FileConfigurationSource source = CreateFileSource(sourceKind, fileProvider, "missing", optional: false);
+            var manager = new ConfigurationManager();
+            var failure = new InvalidOperationException("Initial load failed after reentrant publication.");
+            FileConfigurationProvider publishedProvider = null;
+            source.OnLoadException = context =>
+            {
+                source.OnLoadException = null;
+                source.Optional = true;
+                publishedProvider = context.Provider;
+                manager.Sources.Add(new CachedProviderSource(publishedProvider));
+                throw failure;
+            };
+
+            Assert.Same(failure, Assert.Throws<InvalidOperationException>(() => manager.Sources.Add(source)));
+            Assert.DoesNotContain(source, manager.Sources);
+            Assert.Contains(publishedProvider, ((IConfigurationRoot)manager).Providers);
+            Assert.Equal(1, fileProvider.LiveCallbackRegistrationCount);
+
+            fileProvider.SetContent(GetFileContent(sourceKind, "recovered"));
+            ((IConfigurationRoot)manager).Reload();
+            Assert.Equal("recovered", manager["Key"]);
+
+            manager.Dispose();
+            Assert.Equal(0, fileProvider.LiveCallbackRegistrationCount);
+            Assert.Equal(0, fileProvider.DisposeCount);
+        }
+
+        [Theory]
+        [MemberData(nameof(FileSourceFailureStages))]
+        public void FailedManagerSourceReloadDisposesCandidateAndPreservesActiveFileProvider(
+            FileSourceKind sourceKind,
+            TestFailureStage failureStage)
+        {
+            var fileProvider = new TrackingFileProvider();
+            fileProvider.SetContent(GetFileContent(sourceKind, "initial"));
+            FileConfigurationSource source = CreateFileSource(sourceKind, fileProvider, "settings", optional: false);
+            var failureSource = new FaultingConfigurationSource();
+            var manager = new ConfigurationManager();
+            IConfigurationBuilder builder = manager;
+            manager.Sources.Add(source);
+            manager.Sources.Add(failureSource);
+            FileConfigurationProvider activeProvider = Assert.Single(
+                ((IConfigurationRoot)manager).Providers.OfType<FileConfigurationProvider>());
+            FaultingConfigurationProvider activeFailureProvider = Assert.Single(failureSource.Providers);
+            InvalidOperationException failure = failureSource.FailAt(failureStage);
+
+            Assert.Same(failure, Assert.Throws<InvalidOperationException>(() => builder.Properties["failed"] = true));
+            Assert.Same(activeProvider, Assert.Single(
+                ((IConfigurationRoot)manager).Providers.OfType<FileConfigurationProvider>()));
+            Assert.Equal(2, fileProvider.WatchCallCount);
+            Assert.Equal(1, fileProvider.LiveCallbackRegistrationCount);
+            Assert.Equal(1, activeFailureProvider.Token.RegistrationCount);
+            Assert.Equal("initial", manager["Key"]);
+            Assert.All(failureSource.Providers, provider => Assert.Equal(0, provider.DisposeCount));
+
+            failureSource.ClearFailure();
+            fileProvider.SetContent(GetFileContent(sourceKind, "updated"));
+            ((IConfigurationRoot)manager).Reload();
+            Assert.Equal("updated", manager["Key"]);
+            Assert.Equal(1, fileProvider.LiveCallbackRegistrationCount);
+
+            builder.Properties["retry"] = true;
+            FileConfigurationProvider replacementProvider = Assert.Single(
+                ((IConfigurationRoot)manager).Providers.OfType<FileConfigurationProvider>());
+            Assert.NotSame(activeProvider, replacementProvider);
+            Assert.Equal(3, fileProvider.WatchCallCount);
+            Assert.Equal(1, fileProvider.LiveCallbackRegistrationCount);
+            Assert.Equal("updated", manager["Key"]);
+
+            manager.Dispose();
+            Assert.Equal(0, fileProvider.LiveCallbackRegistrationCount);
+            Assert.Equal(0, fileProvider.DisposeCount);
+        }
+
+        [Theory]
+        [InlineData(FileSourceKind.Json)]
+        [InlineData(FileSourceKind.Ini)]
+        [InlineData(FileSourceKind.Xml)]
+        public void FailedDirectRootConstructionDoesNotDisposeSuppliedFileProvider(FileSourceKind sourceKind)
+        {
+            var fileProvider = new TrackingFileProvider();
+            FileConfigurationSource source = CreateFileSource(sourceKind, fileProvider, "missing");
+            IConfigurationProvider suppliedFileProvider = source.Build(new ConfigurationBuilder());
+            var registeredSource = new FaultingConfigurationSource();
+            var failingSource = new FaultingConfigurationSource();
+            var builder = new ConfigurationBuilder();
+            var registeredProvider = (FaultingConfigurationProvider)registeredSource.Build(builder);
+            var failingProvider = (FaultingConfigurationProvider)failingSource.Build(builder);
+            InvalidOperationException failure = failingSource.FailAt(TestFailureStage.Load);
+
+            Assert.Same(failure, Assert.Throws<InvalidOperationException>(() =>
+                new ConfigurationRoot(new[] { registeredProvider, suppliedFileProvider, failingProvider })));
+            Assert.Equal(0, registeredProvider.Token.RegistrationCount);
+            Assert.Equal(1, fileProvider.LiveCallbackRegistrationCount);
+            Assert.Equal(0, fileProvider.DisposeCount);
+            Assert.Equal(0, registeredProvider.DisposeCount);
+            Assert.Equal(0, failingProvider.DisposeCount);
+
+            ((IDisposable)suppliedFileProvider).Dispose();
+            Assert.Equal(0, fileProvider.LiveCallbackRegistrationCount);
+            Assert.Equal(0, fileProvider.DisposeCount);
+        }
+
+        [Theory]
+        [InlineData(FileSourceKind.Json, false)]
+        [InlineData(FileSourceKind.Ini, false)]
+        [InlineData(FileSourceKind.Xml, false)]
+        [InlineData(FileSourceKind.Json, true)]
+        [InlineData(FileSourceKind.Ini, true)]
+        [InlineData(FileSourceKind.Xml, true)]
+        public void FailedBuildDoesNotDisposeCachedStandardFileProvider(
+            FileSourceKind sourceKind,
+            bool useDerivedSource)
+        {
+            var fileProvider = new TrackingFileProvider();
+            fileProvider.SetContent(GetFileContent(sourceKind, "initial"));
+            FileConfigurationSource providerSource = CreateFileSource(sourceKind, fileProvider, "settings", optional: false);
+            IConfigurationProvider cachedProvider = providerSource.Build(new ConfigurationBuilder());
+            var liveRoot = (ConfigurationRoot)new ConfigurationBuilder()
+                .Add(new CachedProviderSource(cachedProvider))
+                .Build();
+            IConfigurationSource cachedSource = CreateCachedProviderSource(sourceKind, cachedProvider, useDerivedSource);
+            var failureSource = new FaultingConfigurationSource();
+            InvalidOperationException failure = failureSource.FailAt(TestFailureStage.Build);
+            var failingBuilder = new ConfigurationBuilder();
+            failingBuilder.Add(cachedSource);
+            failingBuilder.Add(failureSource);
+
+            Assert.Same(failure, Assert.Throws<InvalidOperationException>(() => failingBuilder.Build()));
+            Assert.Equal(1, fileProvider.LiveCallbackRegistrationCount);
+            Assert.Equal(0, fileProvider.DisposeCount);
+            Assert.Equal("initial", liveRoot["Key"]);
+
+            fileProvider.SetContent(GetFileContent(sourceKind, "updated"));
+            liveRoot.Reload();
+            Assert.Equal("updated", liveRoot["Key"]);
+
+            liveRoot.Dispose();
+            Assert.Equal(0, fileProvider.LiveCallbackRegistrationCount);
+            Assert.Equal(0, fileProvider.DisposeCount);
         }
 
         [Fact]
@@ -1275,6 +1496,322 @@ IniKey1=IniValue2");
                     Assert.NotEqual(previousWriteTimes[i], File.GetLastWriteTimeUtc(filePaths[i]));
                 }
             }
+        }
+
+        public enum FileSourceKind
+        {
+            Json,
+            Ini,
+            Xml
+        }
+
+        public enum TestFailureStage
+        {
+            Build,
+            Load,
+            GetReloadToken,
+            RegisterChangeCallback
+        }
+
+        public static IEnumerable<object[]> FileSourceFailureStages()
+        {
+            foreach (FileSourceKind sourceKind in new[] { FileSourceKind.Json, FileSourceKind.Ini, FileSourceKind.Xml })
+            {
+                foreach (TestFailureStage failureStage in new[]
+                {
+                    TestFailureStage.Build,
+                    TestFailureStage.Load,
+                    TestFailureStage.GetReloadToken,
+                    TestFailureStage.RegisterChangeCallback
+                })
+                {
+                    yield return new object[] { sourceKind, failureStage };
+                }
+            }
+        }
+
+        private static FileConfigurationSource CreateFileSource(
+            FileSourceKind sourceKind,
+            TrackingFileProvider fileProvider,
+            string path,
+            bool optional = true)
+        {
+            FileConfigurationSource source = sourceKind switch
+            {
+                FileSourceKind.Json => new JsonConfigurationSource(),
+                FileSourceKind.Ini => new IniConfigurationSource(),
+                FileSourceKind.Xml => new XmlConfigurationSource(),
+                _ => throw new ArgumentOutOfRangeException(nameof(sourceKind))
+            };
+
+            source.FileProvider = fileProvider;
+            source.Path = path;
+            source.Optional = optional;
+            source.ReloadOnChange = true;
+            return source;
+        }
+
+        private static IConfigurationSource CreateCachedProviderSource(
+            FileSourceKind sourceKind,
+            IConfigurationProvider provider,
+            bool useDerivedSource)
+        {
+            if (!useDerivedSource)
+            {
+                return new CachedProviderSource(provider);
+            }
+
+            return sourceKind switch
+            {
+                FileSourceKind.Json => new CachedJsonConfigurationSource(provider),
+                FileSourceKind.Ini => new CachedIniConfigurationSource(provider),
+                FileSourceKind.Xml => new CachedXmlConfigurationSource(provider),
+                _ => throw new ArgumentOutOfRangeException(nameof(sourceKind))
+            };
+        }
+
+        private static string GetFileContent(FileSourceKind sourceKind, string value) =>
+            sourceKind switch
+            {
+                FileSourceKind.Json => $"{{\"Key\":\"{value}\"}}",
+                FileSourceKind.Ini => $"Key={value}",
+                FileSourceKind.Xml => $"<settings Key=\"{value}\" />",
+                _ => throw new ArgumentOutOfRangeException(nameof(sourceKind))
+            };
+
+        private sealed class TrackingFileProvider : IFileProvider, IDisposable
+        {
+            private byte[] _content;
+            private int _disposeCount;
+            private int _liveCallbackRegistrationCount;
+            private int _watchCallCount;
+
+            public int DisposeCount => Volatile.Read(ref _disposeCount);
+
+            public int LiveCallbackRegistrationCount => Volatile.Read(ref _liveCallbackRegistrationCount);
+
+            public int WatchCallCount => Volatile.Read(ref _watchCallCount);
+
+            public void SetContent(string content) => _content = Encoding.UTF8.GetBytes(content);
+
+            public IDirectoryContents GetDirectoryContents(string subpath) => NotFoundDirectoryContents.Singleton;
+
+            public IFileInfo GetFileInfo(string subpath) =>
+                _content is null ? new NotFoundFileInfo(subpath) : new MemoryFileInfo(subpath, _content);
+
+            public IChangeToken Watch(string filter)
+            {
+                Interlocked.Increment(ref _watchCallCount);
+                return new TrackingChangeToken(this);
+            }
+
+            public void Dispose() => Interlocked.Increment(ref _disposeCount);
+
+            private void RegisterCallback() => Interlocked.Increment(ref _liveCallbackRegistrationCount);
+
+            private void UnregisterCallback() => Interlocked.Decrement(ref _liveCallbackRegistrationCount);
+
+            private sealed class TrackingChangeToken : IChangeToken
+            {
+                private readonly TrackingFileProvider _owner;
+
+                public TrackingChangeToken(TrackingFileProvider owner)
+                {
+                    _owner = owner;
+                }
+
+                public bool ActiveChangeCallbacks => true;
+
+                public bool HasChanged => false;
+
+                public IDisposable RegisterChangeCallback(Action<object> callback, object state)
+                {
+                    _owner.RegisterCallback();
+                    return new CallbackRegistration(_owner.UnregisterCallback);
+                }
+            }
+        }
+
+        private sealed class MemoryFileInfo : IFileInfo
+        {
+            private readonly byte[] _content;
+
+            public MemoryFileInfo(string name, byte[] content)
+            {
+                Name = name;
+                _content = content;
+            }
+
+            public bool Exists => true;
+
+            public bool IsDirectory => false;
+
+            public DateTimeOffset LastModified => default;
+
+            public long Length => _content.Length;
+
+            public string Name { get; }
+
+            public string PhysicalPath => null;
+
+            public Stream CreateReadStream() => new MemoryStream(_content, writable: false);
+        }
+
+        private sealed class FaultingConfigurationSource : IConfigurationSource
+        {
+            private readonly List<FaultingConfigurationProvider> _providers = new();
+
+            public IReadOnlyList<FaultingConfigurationProvider> Providers => _providers;
+
+            public TestFailureStage? FailureStage { get; private set; }
+
+            public InvalidOperationException Failure { get; } =
+                new InvalidOperationException("Configuration initialisation failed.");
+
+            public IConfigurationProvider Build(IConfigurationBuilder builder)
+            {
+                if (FailureStage is TestFailureStage.Build)
+                {
+                    throw Failure;
+                }
+
+                var provider = new FaultingConfigurationProvider(this);
+                _providers.Add(provider);
+                return provider;
+            }
+
+            public InvalidOperationException FailAt(TestFailureStage failureStage)
+            {
+                FailureStage = failureStage;
+                return Failure;
+            }
+
+            public void ClearFailure() => FailureStage = null;
+        }
+
+        private sealed class FaultingConfigurationProvider : ConfigurationProvider, IConfigurationProvider, IDisposable
+        {
+            private readonly FaultingConfigurationSource _source;
+
+            public FaultingConfigurationProvider(FaultingConfigurationSource source)
+            {
+                _source = source;
+                Token = new FaultingChangeToken(source);
+                Set("FaultingProvider", "value");
+            }
+
+            public int DisposeCount { get; private set; }
+
+            public FaultingChangeToken Token { get; }
+
+            public override void Load()
+            {
+                if (_source.FailureStage is TestFailureStage.Load)
+                {
+                    throw _source.Failure;
+                }
+            }
+
+            IChangeToken IConfigurationProvider.GetReloadToken()
+            {
+                if (_source.FailureStage is TestFailureStage.GetReloadToken)
+                {
+                    throw _source.Failure;
+                }
+
+                return Token;
+            }
+
+            public void Dispose() => DisposeCount++;
+        }
+
+        private sealed class FaultingChangeToken : IChangeToken
+        {
+            private readonly FaultingConfigurationSource _source;
+
+            public FaultingChangeToken(FaultingConfigurationSource source)
+            {
+                _source = source;
+            }
+
+            public int RegistrationCount { get; private set; }
+
+            public bool ActiveChangeCallbacks => true;
+
+            public bool HasChanged => false;
+
+            public IDisposable RegisterChangeCallback(Action<object> callback, object state)
+            {
+                if (_source.FailureStage is TestFailureStage.RegisterChangeCallback)
+                {
+                    throw _source.Failure;
+                }
+
+                RegistrationCount++;
+                return new CallbackRegistration(Unregister);
+            }
+
+            private void Unregister() => RegistrationCount--;
+        }
+
+        private sealed class CallbackRegistration : IDisposable
+        {
+            private Action _dispose;
+
+            public CallbackRegistration(Action dispose)
+            {
+                _dispose = dispose;
+            }
+
+            public void Dispose() => Interlocked.Exchange(ref _dispose, null)?.Invoke();
+        }
+
+        private sealed class CachedProviderSource : IConfigurationSource
+        {
+            private readonly IConfigurationProvider _provider;
+
+            public CachedProviderSource(IConfigurationProvider provider)
+            {
+                _provider = provider;
+            }
+
+            public IConfigurationProvider Build(IConfigurationBuilder builder) => _provider;
+        }
+
+        private sealed class CachedJsonConfigurationSource : JsonConfigurationSource
+        {
+            private readonly IConfigurationProvider _provider;
+
+            public CachedJsonConfigurationSource(IConfigurationProvider provider)
+            {
+                _provider = provider;
+            }
+
+            public override IConfigurationProvider Build(IConfigurationBuilder builder) => _provider;
+        }
+
+        private sealed class CachedIniConfigurationSource : IniConfigurationSource
+        {
+            private readonly IConfigurationProvider _provider;
+
+            public CachedIniConfigurationSource(IConfigurationProvider provider)
+            {
+                _provider = provider;
+            }
+
+            public override IConfigurationProvider Build(IConfigurationBuilder builder) => _provider;
+        }
+
+        private sealed class CachedXmlConfigurationSource : XmlConfigurationSource
+        {
+            private readonly IConfigurationProvider _provider;
+
+            public CachedXmlConfigurationSource(IConfigurationProvider provider)
+            {
+                _provider = provider;
+            }
+
+            public override IConfigurationProvider Build(IConfigurationBuilder builder) => _provider;
         }
 
         private sealed class MyOptions

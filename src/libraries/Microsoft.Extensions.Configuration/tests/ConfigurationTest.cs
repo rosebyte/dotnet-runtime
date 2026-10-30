@@ -6,12 +6,179 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using Microsoft.Extensions.Configuration.Memory;
+using Microsoft.Extensions.Primitives;
 using Xunit;
 
 namespace Microsoft.Extensions.Configuration.Test
 {
     public class ConfigurationTest
     {
+        [Theory]
+        [InlineData(ConfigurationFailureStage.Build, false)]
+        [InlineData(ConfigurationFailureStage.Build, true)]
+        [InlineData(ConfigurationFailureStage.Load, false)]
+        [InlineData(ConfigurationFailureStage.Load, true)]
+        [InlineData(ConfigurationFailureStage.GetReloadToken, false)]
+        [InlineData(ConfigurationFailureStage.GetReloadToken, true)]
+        [InlineData(ConfigurationFailureStage.RegisterChangeCallback, false)]
+        [InlineData(ConfigurationFailureStage.RegisterChangeCallback, true)]
+        public void FailedBuildDisposesOwnedCandidates(ConfigurationFailureStage stage, bool cleanupThrows)
+        {
+            var first = new OwnedConfigurationFailureSource();
+            var last = new OwnedConfigurationFailureSource();
+            using var borrowedProvider = new ConfigurationFailureProvider();
+            var failingSource = new ConfigurationFailureSource(borrowedProvider);
+            Exception failure = failingSource.SetFailure(stage);
+            var cleanupFailure = new InvalidOperationException("Owned provider disposal failed.");
+            first.Configure = p => p.DisposeException = cleanupThrows ? cleanupFailure : null;
+            var builder = new ConfigurationBuilder().Add(first).Add(failingSource).Add(last);
+
+            if (cleanupThrows)
+            {
+                AggregateException exception = Assert.Throws<AggregateException>(() => builder.Build());
+                Assert.Equal(new[] { failure, cleanupFailure }, exception.Flatten().InnerExceptions);
+            }
+            else
+            {
+                Assert.Same(failure, Assert.Throws<InvalidOperationException>(() => builder.Build()));
+            }
+
+            Assert.Equal(1, first.Provider.DisposeCount);
+            Assert.Equal(0, first.Provider.Token.RegistrationCount);
+            Assert.Equal(0, borrowedProvider.DisposeCount);
+            if (stage != ConfigurationFailureStage.Build)
+            {
+                Assert.Equal(1, last.Provider.DisposeCount);
+            }
+        }
+
+        [Fact]
+        public void FailedBuildWithSourceMutationDoesNotMisidentifyOwnedCandidates()
+        {
+            using var cached = new ConfigurationFailureProvider();
+            using var liveRoot = new ConfigurationRoot(new[] { cached });
+            var source = new ConfigurationFailureSource(cached)
+            {
+                BeforeBuild = builder => builder.Sources.Insert(0, new OwnedConfigurationFailureSource())
+            };
+            var builder = new ConfigurationBuilder().Add(source);
+
+            Assert.Throws<InvalidOperationException>(() => builder.Build());
+            Assert.Equal(0, cached.DisposeCount);
+            Assert.Equal(1, cached.Token.RegistrationCount);
+            Assert.Equal("value", liveRoot["key"]);
+        }
+
+        [Theory]
+        [InlineData(false)]
+        [InlineData(true)]
+        public void FailedBuildDoesNotDisposeExistingChainedConfiguration(bool shouldDispose)
+        {
+            using var provider = new ConfigurationFailureProvider();
+            using var configuration = new ConfigurationRoot(new[] { provider });
+            using var failing = new ConfigurationFailureProvider();
+            var failingSource = new ConfigurationFailureSource(failing);
+            Exception failure = failingSource.SetFailure(ConfigurationFailureStage.Load);
+            var builder = new ConfigurationBuilder()
+                .AddConfiguration(configuration, shouldDisposeConfiguration: shouldDispose)
+                .Add(failingSource);
+
+            Assert.Same(failure, Assert.Throws<InvalidOperationException>(() => builder.Build()));
+            Assert.Equal(0, provider.DisposeCount);
+            Assert.Equal(1, provider.Token.RegistrationCount);
+            Assert.Equal("value", configuration["key"]);
+        }
+
+        [Theory]
+        [InlineData(false, ConfigurationFailureStage.Load)]
+        [InlineData(false, ConfigurationFailureStage.GetReloadToken)]
+        [InlineData(false, ConfigurationFailureStage.RegisterChangeCallback)]
+        [InlineData(true, ConfigurationFailureStage.Build)]
+        [InlineData(true, ConfigurationFailureStage.Load)]
+        [InlineData(true, ConfigurationFailureStage.GetReloadToken)]
+        [InlineData(true, ConfigurationFailureStage.RegisterChangeCallback)]
+        public void FailedConstructionPreservesProvidersAndReleasesRegistrations(bool useBuilder, ConfigurationFailureStage stage)
+        {
+            using var first = new ConfigurationFailureProvider();
+            using var second = new ConfigurationFailureProvider();
+            using var last = new ConfigurationFailureProvider();
+            var failingSource = new ConfigurationFailureSource(second);
+            Exception failure = failingSource.SetFailure(stage);
+            var builder = new ConfigurationBuilder()
+                .Add(new ConfigurationFailureSource(first))
+                .Add(failingSource)
+                .Add(new ConfigurationFailureSource(last));
+
+            Assert.Same(failure, Assert.Throws<InvalidOperationException>(() =>
+                useBuilder ? builder.Build() : new ConfigurationRoot(new[] { first, second, last })));
+
+            foreach (ConfigurationFailureProvider provider in new[] { first, second, last })
+            {
+                Assert.Equal(0, provider.Token.RegistrationCount);
+                Assert.Equal(0, provider.DisposeCount);
+            }
+
+            failingSource.ClearFailure();
+            using var root = (ConfigurationRoot)builder.Build();
+            Assert.Equal(1, first.Token.RegistrationCount);
+            Assert.Equal(1, second.Token.RegistrationCount);
+            Assert.Equal(1, last.Token.RegistrationCount);
+        }
+
+        [Theory]
+        [InlineData(ConfigurationFailureStage.Build)]
+        [InlineData(ConfigurationFailureStage.Load)]
+        [InlineData(ConfigurationFailureStage.GetReloadToken)]
+        [InlineData(ConfigurationFailureStage.RegisterChangeCallback)]
+        public void FailedBuildPreservesCachedProviderInAnotherRoot(ConfigurationFailureStage stage)
+        {
+            using var cached = new ConfigurationFailureProvider();
+            using var failing = new ConfigurationFailureProvider();
+            var source = new ConfigurationFailureSource(cached);
+            var builder = new ConfigurationBuilder().Add(source);
+            using var liveRoot = (ConfigurationRoot)builder.Build();
+            var failingSource = new ConfigurationFailureSource(failing);
+            Exception failure = failingSource.SetFailure(stage);
+            builder.Add(failingSource);
+
+            Assert.Same(failure, Assert.Throws<InvalidOperationException>(() => builder.Build()));
+            Assert.Equal(0, cached.DisposeCount);
+            Assert.Equal(1, cached.Token.RegistrationCount);
+            Assert.Equal(0, failing.Token.RegistrationCount);
+            Assert.Equal("value", liveRoot["key"]);
+
+            IChangeToken token = liveRoot.GetReloadToken();
+            cached.Reload();
+            Assert.True(token.HasChanged);
+        }
+
+        [Theory]
+        [InlineData(false)]
+        [InlineData(true)]
+        public void FailedConstructionAttemptsAllRegistrationCleanup(bool useBuilder)
+        {
+            using var first = new ConfigurationFailureProvider();
+            using var second = new ConfigurationFailureProvider();
+            using var failing = new ConfigurationFailureProvider();
+            var disposalFailure = new InvalidOperationException("Registration disposal failed.");
+            first.Token.DisposeException = disposalFailure;
+            var failingSource = new ConfigurationFailureSource(failing);
+            Exception failure = failingSource.SetFailure(ConfigurationFailureStage.Load);
+            var builder = new ConfigurationBuilder()
+                .Add(new ConfigurationFailureSource(first))
+                .Add(new ConfigurationFailureSource(second))
+                .Add(failingSource);
+
+            AggregateException exception = Assert.Throws<AggregateException>(() =>
+                useBuilder ? builder.Build() : new ConfigurationRoot(new[] { first, second, failing }));
+
+            Assert.Equal(new[] { failure, disposalFailure }, exception.InnerExceptions);
+            Assert.Equal(0, first.Token.RegistrationCount);
+            Assert.Equal(0, second.Token.RegistrationCount);
+            Assert.Equal(0, first.DisposeCount);
+            Assert.Equal(0, second.DisposeCount);
+        }
+
         [Fact]
         public void LoadAndCombineKeyValuePairsFromDifferentConfigurationProviders()
         {
@@ -1004,6 +1171,170 @@ namespace Microsoft.Extensions.Configuration.Test
 
             // Assert
             Assert.NotNull(config);
+        }
+    }
+
+    public enum ConfigurationFailureStage
+    {
+        Build,
+        Load,
+        GetReloadToken,
+        RegisterChangeCallback
+    }
+
+    internal sealed class ConfigurationFailureSource(ConfigurationFailureProvider provider) : IConfigurationSource
+    {
+        public ConfigurationFailureProvider Provider { get; set; } = provider;
+        public Exception BuildException { get; set; }
+        public Action<IConfigurationBuilder> BeforeBuild { get; set; }
+        public int BuildCount { get; private set; }
+
+        public IConfigurationProvider Build(IConfigurationBuilder builder)
+        {
+            BuildCount++;
+            BeforeBuild?.Invoke(builder);
+            if (BuildException is not null)
+            {
+                throw BuildException;
+            }
+
+            return Provider;
+        }
+
+        public Exception SetFailure(ConfigurationFailureStage stage)
+        {
+            var exception = new InvalidOperationException("Configuration initialisation failed.");
+            switch (stage)
+            {
+                case ConfigurationFailureStage.Build:
+                    BuildException = exception;
+                    break;
+                case ConfigurationFailureStage.Load:
+                    Provider.LoadException = exception;
+                    break;
+                case ConfigurationFailureStage.GetReloadToken:
+                    Provider.GetReloadTokenException = exception;
+                    break;
+                case ConfigurationFailureStage.RegisterChangeCallback:
+                    Provider.Token.RegisterException = exception;
+                    break;
+                default:
+                    throw new ArgumentOutOfRangeException(nameof(stage));
+            }
+
+            return exception;
+        }
+
+        public void ClearFailure()
+        {
+            BuildException = null;
+            Provider.LoadException = null;
+            Provider.GetReloadTokenException = null;
+            Provider.Token.RegisterException = null;
+        }
+    }
+
+    internal sealed class OwnedConfigurationFailureSource : IConfigurationSource, IConfigurationSourceWithOwnedProviders
+    {
+        public Action<ConfigurationFailureProvider> Configure { get; set; }
+        public ConfigurationFailureProvider Provider { get; private set; }
+
+        bool IConfigurationSourceWithOwnedProviders.OwnsProviders => true;
+
+        public IConfigurationProvider Build(IConfigurationBuilder builder)
+        {
+            Provider = new ConfigurationFailureProvider();
+            Configure?.Invoke(Provider);
+            return Provider;
+        }
+    }
+
+    internal sealed class ConfigurationFailureProvider : ConfigurationProvider, IConfigurationProvider, IDisposable
+    {
+        public ConfigurationFailureProvider() => Set("key", "value");
+
+        public ConfigurationFailureToken Token { get; private set; } = new();
+        public Exception LoadException { get; set; }
+        public Exception GetReloadTokenException { get; set; }
+        public Exception DisposeException { get; set; }
+        public int DisposeCount { get; private set; }
+
+        public override void Load()
+        {
+            if (LoadException is not null)
+            {
+                throw LoadException;
+            }
+        }
+
+        IChangeToken IConfigurationProvider.GetReloadToken()
+        {
+            if (GetReloadTokenException is not null)
+            {
+                throw GetReloadTokenException;
+            }
+
+            return Token;
+        }
+
+        public void Reload()
+        {
+            ConfigurationFailureToken previousToken = Token;
+            Token = new ConfigurationFailureToken();
+            previousToken.OnReload();
+        }
+
+        public void Dispose()
+        {
+            DisposeCount++;
+            if (DisposeException is not null)
+            {
+                throw DisposeException;
+            }
+        }
+    }
+
+    internal sealed class ConfigurationFailureToken : IChangeToken
+    {
+        private readonly ConfigurationReloadToken _token = new();
+
+        public int RegistrationCount { get; private set; }
+        public Exception RegisterException { get; set; }
+        public Exception DisposeException { get; set; }
+        public bool HasChanged => _token.HasChanged;
+        public bool ActiveChangeCallbacks => true;
+
+        public IDisposable RegisterChangeCallback(Action<object> callback, object state)
+        {
+            if (RegisterException is not null)
+            {
+                throw RegisterException;
+            }
+
+            IDisposable registration = _token.RegisterChangeCallback(callback, state);
+            RegistrationCount++;
+            return new Registration(this, registration);
+        }
+
+        public void OnReload() => _token.OnReload();
+
+        private sealed class Registration(ConfigurationFailureToken token, IDisposable registration) : IDisposable
+        {
+            private bool _disposed;
+
+            public void Dispose()
+            {
+                if (!_disposed)
+                {
+                    _disposed = true;
+                    token.RegistrationCount--;
+                    registration.Dispose();
+                    if (token.DisposeException is not null)
+                    {
+                        throw token.DisposeException;
+                    }
+                }
+            }
         }
     }
 }

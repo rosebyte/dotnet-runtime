@@ -34,7 +34,7 @@ namespace Microsoft.Extensions.Configuration
 
         // _changeTokenRegistrations is only modified when config sources are modified. It is not referenced by any read operations.
         // Because modify config sources is not thread-safe, modifying _changeTokenRegistrations does not need to be thread-safe either.
-        private readonly List<IDisposable> _changeTokenRegistrations = new();
+        private List<IDisposable> _changeTokenRegistrations = new();
         private ConfigurationReloadToken _changeToken = new();
 
         /// <summary>
@@ -78,7 +78,7 @@ namespace Microsoft.Extensions.Configuration
         // We cannot track the duration of the reference to the providers if this property is used.
         // If a configuration source is removed after this is accessed but before it's completely enumerated,
         // this may allow access to a disposed provider.
-        IEnumerable<IConfigurationProvider> IConfigurationRoot.Providers => _providerManager.NonReferenceCountedProviders;
+        IEnumerable<IConfigurationProvider> IConfigurationRoot.Providers => _providerManager.CurrentProviders.NonReferenceCountedProviders;
 
         /// <inheritdoc/>
         public void Dispose()
@@ -124,35 +124,88 @@ namespace Microsoft.Extensions.Configuration
         private void AddSource(IConfigurationSource source)
         {
             IConfigurationProvider provider = source.Build(this);
+            IDisposable? registration = null;
 
-            provider.Load();
-            _changeTokenRegistrations.Add(ChangeToken.OnChange(provider.GetReloadToken, RaiseChanged));
+            try
+            {
+                provider.Load();
+                registration = ChangeToken.OnChange(provider.GetReloadToken, RaiseChanged);
+                _changeTokenRegistrations.Add(registration);
 
-            _providerManager.AddProvider(provider);
-            RaiseChanged();
+                _providerManager.AddProvider(provider);
+            }
+            catch (Exception exception)
+            {
+                var resources = new List<IDisposable>();
+                if (registration is not null)
+                {
+                    _changeTokenRegistrations.Remove(registration);
+                    resources.Add(registration);
+                }
+                if (ConfigurationRoot.GetOwnedProvider(source, provider, _providerManager.CurrentProviders.NonReferenceCountedProviders) is IDisposable ownedProvider)
+                {
+                    resources.Add(ownedProvider);
+                }
+
+                ConfigurationRoot.DisposeResources(resources, exception);
+                throw;
+            }
         }
 
         // Something other than Add was called on IConfigurationBuilder.Sources or IConfigurationBuilder.Properties has changed.
         private void ReloadSources()
         {
-            DisposeRegistrations();
-
-            _changeTokenRegistrations.Clear();
-
             var newProvidersList = new List<IConfigurationProvider>();
+            var newRegistrations = new List<IDisposable>();
+            ReferenceCountedProviders oldProviders;
+            using List<IConfigurationSource>.Enumerator sources = _sources.GetEnumerator();
 
-            foreach (IConfigurationSource source in _sources)
+            try
             {
-                newProvidersList.Add(source.Build(this));
+                while (sources.MoveNext())
+                {
+                    newProvidersList.Add(sources.Current.Build(this));
+                }
+
+                foreach (IConfigurationProvider p in newProvidersList)
+                {
+                    p.Load();
+                    newRegistrations.Add(ChangeToken.OnChange(p.GetReloadToken, RaiseChanged));
+                }
+
+                oldProviders = _providerManager.ReplaceProviders(newProvidersList);
+            }
+            catch (Exception exception)
+            {
+                ConfigurationRoot.AddOwnedProviders(
+                    newRegistrations, _sources, newProvidersList, sources, _providerManager.CurrentProviders.NonReferenceCountedProviders);
+                ConfigurationRoot.DisposeResources(newRegistrations, exception);
+                throw;
             }
 
-            foreach (IConfigurationProvider p in newProvidersList)
+            List<IDisposable> oldRegistrations = _changeTokenRegistrations;
+            _changeTokenRegistrations = newRegistrations;
+
+            // Retirement and notification run after publication and outside the provider lock.
+            oldRegistrations.Add(oldProviders);
+            try
             {
-                p.Load();
-                _changeTokenRegistrations.Add(ChangeToken.OnChange(p.GetReloadToken, RaiseChanged));
+                ConfigurationRoot.DisposeResources(oldRegistrations);
+            }
+            catch (Exception exception)
+            {
+                try
+                {
+                    RaiseChanged();
+                }
+                catch (Exception notificationException)
+                {
+                    throw new AggregateException(exception, notificationException);
+                }
+
+                throw;
             }
 
-            _providerManager.ReplaceProviders(newProvidersList);
             RaiseChanged();
         }
 
@@ -209,8 +262,26 @@ namespace Microsoft.Extensions.Configuration
 
             public void Add(IConfigurationSource source)
             {
+                int index = _sources.Count;
+                ReferenceCountedProviders previousProviders = _config._providerManager.CurrentProviders;
                 _sources.Add(source);
-                _config.AddSource(source);
+                try
+                {
+                    _config.AddSource(source);
+                }
+                catch
+                {
+                    // Reentrant source edits may already have accepted this source or moved its entry.
+                    if (ReferenceEquals(previousProviders, _config._providerManager.CurrentProviders) &&
+                        (uint)index < (uint)_sources.Count && ReferenceEquals(_sources[index], source))
+                    {
+                        _sources.RemoveAt(index);
+                    }
+
+                    throw;
+                }
+
+                _config.RaiseChanged();
             }
 
             public void Clear()
